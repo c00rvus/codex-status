@@ -3,7 +3,11 @@ param(
     [ValidateSet('Debug', 'Release')]
     [string]$Configuration = 'Release',
     [ValidateSet('x64')]
-    [string]$Platform = 'x64'
+    [string]$Platform = 'x64',
+    [string]$OutputPath,
+    [string]$ManifestPath,
+    [string]$PackageVersion,
+    [switch]$WindowsAppSDKSelfContained
 )
 
 Set-StrictMode -Version Latest
@@ -13,27 +17,70 @@ $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $project = Join-Path $root 'Codex.TaskbarStatus.ExtensionApp\Codex.TaskbarStatus.ExtensionApp.csproj'
 $packageRoot = Join-Path $root 'Codex.TaskbarStatus (Package)'
 $artifacts = Join-Path $root 'artifacts'
-$targetLayout = Join-Path $artifacts 'layout'
-$layout = Join-Path $artifacts ".layout-staging-$([Guid]::NewGuid().ToString('N'))"
-$backupLayout = Join-Path $artifacts ".layout-backup-$([Guid]::NewGuid().ToString('N'))"
+$defaultTargetLayout = Join-Path $artifacts 'layout'
+if ([string]::IsNullOrWhiteSpace($OutputPath)) {
+    $targetLayout = $defaultTargetLayout
+} elseif ([IO.Path]::IsPathRooted($OutputPath)) {
+    $targetLayout = [IO.Path]::GetFullPath($OutputPath)
+} else {
+    $targetLayout = [IO.Path]::GetFullPath((Join-Path $root $OutputPath))
+}
+
+if ([string]::IsNullOrWhiteSpace($ManifestPath)) {
+    $sourceManifest = Join-Path $packageRoot 'Package.local.appxmanifest'
+} elseif ([IO.Path]::IsPathRooted($ManifestPath)) {
+    $sourceManifest = [IO.Path]::GetFullPath($ManifestPath)
+} else {
+    $sourceManifest = [IO.Path]::GetFullPath((Join-Path $root $ManifestPath))
+}
+if (-not (Test-Path -LiteralPath $sourceManifest -PathType Leaf)) {
+    throw "Package manifest was not found: $sourceManifest"
+}
+
+$targetParent = Split-Path $targetLayout -Parent
+$targetName = Split-Path $targetLayout -Leaf
+New-Item -ItemType Directory -Path $targetParent -Force | Out-Null
+$layout = Join-Path $targetParent ".$targetName-staging-$([Guid]::NewGuid().ToString('N'))"
+$backupLayout = Join-Path $targetParent ".$targetName-backup-$([Guid]::NewGuid().ToString('N'))"
 
 # The loose package runs directly from this folder. Stop only our plugin before
 # replacing its assemblies so a later reinstall is safe while WidBar is open.
-$pluginProcesses = @(Get-Process -Name 'Codex.TaskbarStatus.ExtensionApp' -ErrorAction SilentlyContinue)
-if ($pluginProcesses.Count -gt 0) {
-    $pluginProcesses | Stop-Process -Force
-    $pluginProcesses | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
+if ([string]::Equals(
+        [IO.Path]::GetFullPath($targetLayout),
+        [IO.Path]::GetFullPath($defaultTargetLayout),
+        [StringComparison]::OrdinalIgnoreCase)) {
+    $pluginProcesses = @(Get-Process -Name 'Codex.TaskbarStatus.ExtensionApp' -ErrorAction SilentlyContinue)
+    if ($pluginProcesses.Count -gt 0) {
+        $pluginProcesses | Stop-Process -Force
+        $pluginProcesses | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
+    }
 }
 
 try {
     New-Item -ItemType Directory -Path $layout -Force | Out-Null
 
-    dotnet publish $project `
-        --configuration $Configuration `
-        --runtime "win-$Platform" `
-        --self-contained true `
-        --output $layout `
-        -p:Platform=$Platform
+    $publishArguments = @(
+        'publish',
+        $project,
+        '--configuration', $Configuration,
+        '--runtime', "win-$Platform",
+        '--self-contained', 'true',
+        '--output', $layout,
+        "-p:Platform=$Platform"
+    )
+    if ($WindowsAppSDKSelfContained) {
+        $publishArguments += '-p:WindowsAppSDKSelfContained=true'
+    }
+    if (-not [string]::IsNullOrWhiteSpace($PackageVersion)) {
+        $versionSegments = $PackageVersion.Split('.')
+        if ($versionSegments.Count -lt 3) {
+            throw "PackageVersion must contain at least three numeric segments: $PackageVersion"
+        }
+        $pluginVersion = ($versionSegments[0..2] -join '.')
+        $publishArguments += "-p:WidBarPluginVersion=$pluginVersion"
+    }
+
+    & dotnet @publishArguments
     if ($LASTEXITCODE -ne 0) {
         throw "Widget publish failed with exit code $LASTEXITCODE."
     }
@@ -57,12 +104,15 @@ try {
             -Destination (Join-Path $images "$baseImage.png") -Force
     }
     $layoutManifest = Join-Path $layout 'AppxManifest.xml'
-    Copy-Item -LiteralPath (Join-Path $packageRoot 'Package.local.appxmanifest') `
-        -Destination $layoutManifest -Force
+    Copy-Item -LiteralPath $sourceManifest -Destination $layoutManifest -Force
 
     # x-generate is a packaging-project placeholder. Unlike MSBuild packaging,
     # loose Appx registration does not replace it and Windows rejects the manifest.
     [xml]$manifestXml = Get-Content -LiteralPath $layoutManifest -Raw
+    if (-not [string]::IsNullOrWhiteSpace($PackageVersion)) {
+        $manifestXml.Package.Identity.Version = $PackageVersion
+        $manifestXml.Save($layoutManifest)
+    }
     $resourceLanguages = @($manifestXml.Package.Resources.Resource | ForEach-Object Language)
     if (-not $resourceLanguages -or $resourceLanguages -contains 'x-generate') {
         throw 'The local Appx manifest must contain a concrete resource language (for example en-US).'

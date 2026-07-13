@@ -25,7 +25,7 @@
     <WidBarPluginName>Codex Status</WidBarPluginName>
     <WidBarPluginDescription>Local Codex execution status in the taskbar.</WidBarPluginDescription>
     <WidBarPluginCategory>Developer</WidBarPluginCategory>
-    <WidBarPluginVersion>1.0.0</WidBarPluginVersion>
+    <WidBarPluginVersion>1.1.0</WidBarPluginVersion>
     <WidBarPluginPreviewWidth>400</WidBarPluginPreviewWidth>
     <WidBarPluginConfigurable>true</WidBarPluginConfigurable>
   </PropertyGroup>
