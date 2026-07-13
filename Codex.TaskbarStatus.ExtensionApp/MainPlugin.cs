@@ -1,10 +1,11 @@
-using System.Text.Json;
 using Codex.TaskbarStatus.Core;
 using Microsoft.UI;
 using Microsoft.UI.Text;
+using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Automation;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Controls.Primitives;
 using Microsoft.UI.Xaml.Media;
 using WidBar.SDK;
 
@@ -12,16 +13,21 @@ namespace Codex.TaskbarStatus.ExtensionApp;
 
 public sealed class MainPlugin : WidgetPluginBase, IConfigurableWidgetPlugin
 {
-    private static readonly JsonSerializerOptions JsonOptions = new()
-    {
-        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-        PropertyNameCaseInsensitive = true,
-    };
+    private static readonly (string Name, string Hex)[] SpinnerColorPresets =
+    [
+        ("Blue", "#3B9EFF"),
+        ("Cyan", "#22D3EE"),
+        ("Green", "#34D399"),
+        ("Amber", "#FBBF24"),
+        ("Purple", "#C084FC"),
+    ];
 
     private readonly CodexStatusReader _statusReader = new();
+    private readonly CodexRateLimitService _rateLimitService = new();
     private readonly RequestSpinnerAnimator _spinnerAnimator = new();
-    private WidgetSettings _settings = new();
+    private CodexWidgetSettings _settings = new();
     private CodexStatusSnapshot _snapshot = new();
+    private CodexRateLimitSnapshot _rateLimits = CodexRateLimitSnapshot.Unknown;
     private Border? _previewRoot;
     private StackPanel? _flyoutRoot;
     private DispatcherTimer? _refreshTimer;
@@ -43,8 +49,10 @@ public sealed class MainPlugin : WidgetPluginBase, IConfigurableWidgetPlugin
 
     public override Task InitializeAsync(IWidgetContext context)
     {
-        _settings = WidgetSettings.FromJson(context.SettingsJson);
+        _settings = CodexWidgetSettings.FromJson(context.SettingsJson);
         _snapshot = _statusReader.Read();
+        _rateLimits = _rateLimitService.Current;
+        _rateLimitService.RequestRefresh();
         return base.InitializeAsync(context);
     }
 
@@ -91,15 +99,15 @@ public sealed class MainPlugin : WidgetPluginBase, IConfigurableWidgetPlugin
 
     public UIElement CreateSettingsContent(IWidgetSettingsContext context)
     {
-        var draft = WidgetSettings.FromJson(context.SettingsJson);
+        var draft = CodexWidgetSettings.FromJson(context.SettingsJson);
         var root = new Grid
         {
-            MinHeight = 520,
             HorizontalAlignment = HorizontalAlignment.Stretch,
             VerticalAlignment = VerticalAlignment.Stretch,
         };
-        root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+        root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        root.Loaded += (_, _) => ConfigureSettingsWindowMinimumSize(root);
 
         var cards = new Grid
         {
@@ -111,13 +119,25 @@ public sealed class MainPlugin : WidgetPluginBase, IConfigurableWidgetPlugin
         cards.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
 
         var displayedOptions = new StackPanel { Spacing = 6 };
-        AddToggle(displayedOptions, "Status / activity", draft.ShowActivity, value => draft.ShowActivity = value, draft, context);
-        AddToggle(displayedOptions, "Changed files", draft.ShowFiles, value => draft.ShowFiles = value, draft, context);
-        AddToggle(displayedOptions, "Subagents", draft.ShowAgents, value => draft.ShowAgents = value, draft, context);
-        AddToggle(displayedOptions, "Elapsed time", draft.ShowElapsed, value => draft.ShowElapsed = value, draft, context);
+        void RenderDisplayedOptions()
+        {
+            displayedOptions.Children.Clear();
+            for (var index = 0; index < draft.IndicatorOrder.Count; index++)
+            {
+                AddOrderedIndicatorRow(
+                    displayedOptions,
+                    draft.IndicatorOrder[index],
+                    index,
+                    draft,
+                    context,
+                    RenderDisplayedOptions);
+            }
+        }
+        RenderDisplayedOptions();
 
         var behaviorOptions = new StackPanel { Spacing = 6 };
         AddToggle(behaviorOptions, "Animated spinner", draft.ShowPulse, value => draft.ShowPulse = value, draft, context);
+        AddSpinnerColorSelector(behaviorOptions, draft, context);
         AddToggle(behaviorOptions, "Compact mode", draft.Compact, value => draft.Compact = value, draft, context);
         AddToggle(behaviorOptions, "Hide when idle", draft.HideWhenIdle, value => draft.HideWhenIdle = value, draft, context);
 
@@ -126,7 +146,13 @@ public sealed class MainPlugin : WidgetPluginBase, IConfigurableWidgetPlugin
         Grid.SetColumn(behaviorCard, 1);
         cards.Children.Add(displayedCard);
         cards.Children.Add(behaviorCard);
-        root.Children.Add(cards);
+        root.Children.Add(new ScrollViewer
+        {
+            Content = cards,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            VerticalScrollMode = ScrollMode.Auto,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+        });
 
         var attributionLink = new HyperlinkButton
         {
@@ -135,7 +161,7 @@ public sealed class MainPlugin : WidgetPluginBase, IConfigurableWidgetPlugin
             FontSize = 12,
             Opacity = 0.72,
             Padding = new Thickness(0),
-            Margin = new Thickness(4, 18, 0, 4),
+            Margin = new Thickness(4, 8, 0, 0),
             HorizontalAlignment = HorizontalAlignment.Left,
             VerticalAlignment = VerticalAlignment.Bottom,
         };
@@ -150,13 +176,13 @@ public sealed class MainPlugin : WidgetPluginBase, IConfigurableWidgetPlugin
 
     public override void OnSettingsDraftChanged(string settingsJson)
     {
-        _settings = WidgetSettings.FromJson(settingsJson);
+        _settings = CodexWidgetSettings.FromJson(settingsJson);
         RenderPreview();
         SyncSpinnerTimer();
         Context?.RequestPreviewRefresh();
     }
 
-    public override ValueTask DisposeAsync()
+    public override async ValueTask DisposeAsync()
     {
         _refreshTimer?.Stop();
         _refreshTimer = null;
@@ -166,7 +192,7 @@ public sealed class MainPlugin : WidgetPluginBase, IConfigurableWidgetPlugin
         _spinnerText = null;
         _previewRoot = null;
         _flyoutRoot = null;
-        return ValueTask.CompletedTask;
+        await _rateLimitService.DisposeAsync();
     }
 
     private void EnsureTimers()
@@ -179,6 +205,8 @@ public sealed class MainPlugin : WidgetPluginBase, IConfigurableWidgetPlugin
                 var priorVisibility = IsPreviewVisible;
                 var priorWidth = PreviewLogicalWidth;
                 _snapshot = _statusReader.Read();
+                _rateLimitService.RequestRefresh();
+                _rateLimits = _rateLimitService.Current;
                 RenderPreview();
                 SyncSpinnerTimer();
                 RenderFlyout();
@@ -209,70 +237,66 @@ public sealed class MainPlugin : WidgetPluginBase, IConfigurableWidgetPlugin
 
         _spinnerText = null;
 
+        var presentation = PreviewPresentationFactory.Create(
+            _settings,
+            IsActive(_snapshot.Status),
+            _snapshot.FilesChangedCount,
+            _snapshot.TotalSubagents);
+
+        _previewRoot.Padding = new Thickness(
+            presentation.HorizontalPadding,
+            presentation.VerticalPadding,
+            presentation.HorizontalPadding,
+            presentation.VerticalPadding);
+
         var row = new StackPanel
         {
             Orientation = Orientation.Horizontal,
-            Spacing = 8,
+            Spacing = presentation.RowSpacing,
             HorizontalAlignment = HorizontalAlignment.Center,
             VerticalAlignment = VerticalAlignment.Center,
         };
 
         var hasContent = false;
 
-        var presentation = PreviewPresentationFactory.Create(
-            _settings.ShowActivity,
-            _settings.ShowFiles,
-            _settings.ShowAgents,
-            _settings.ShowElapsed,
-            _settings.ShowPulse,
-            IsActive(_snapshot.Status),
-            _settings.Compact,
-            _snapshot.FilesChangedCount,
-            _snapshot.TotalSubagents);
-
-        if (presentation.ShowActivity || presentation.ShowSpinner)
+        for (var itemIndex = 0; itemIndex < presentation.Items.Count; itemIndex++)
         {
-            var activitySegment = new StackPanel
+            var item = presentation.Items[itemIndex];
+            UIElement? segment;
+            if (IsUsageIndicator(item.Kind))
             {
-                Orientation = Orientation.Horizontal,
-                Spacing = 6,
-                VerticalAlignment = VerticalAlignment.Center,
-            };
-
-            if (presentation.ShowActivity)
+                segment = CreateUsageGroup(presentation, ref itemIndex);
+            }
+            else
             {
-                activitySegment.Children.Add(CreateText(
-                    _snapshot.Activity,
-                    presentation.ActivityMaxWidth,
-                    _snapshot.Status == "running" ? Colors.White : Color("#FFD1D6DC")));
+                segment = item.Kind switch
+                {
+                    PreviewIndicatorKind.Activity => CreateActivitySegment(item, presentation),
+                    PreviewIndicatorKind.Files => CreateText(
+                        item.Text ?? string.Empty,
+                        presentation.FilesMaxWidth,
+                        presentation.TextFontSize),
+                    PreviewIndicatorKind.Subagents => CreateText(
+                        item.Text ?? string.Empty,
+                        presentation.SubagentsMaxWidth,
+                        presentation.TextFontSize),
+                    PreviewIndicatorKind.Elapsed => CreateText(
+                        FormatElapsed(_snapshot.Elapsed(DateTimeOffset.UtcNow)),
+                        presentation.ElapsedMaxWidth,
+                        presentation.TextFontSize),
+                    _ => null,
+                };
             }
 
-            if (presentation.ShowSpinner)
+            if (segment is not null)
             {
-                activitySegment.Children.Add(CreateSpinner());
+                AddSegment(row, segment, presentation.SeparatorHeight, ref hasContent);
             }
-
-            AddSegment(row, activitySegment, ref hasContent);
-        }
-
-        if (presentation.FilesText is not null)
-        {
-            AddSegment(row, CreateText(presentation.FilesText, presentation.FilesMaxWidth), ref hasContent);
-        }
-
-        if (presentation.SubagentsText is not null)
-        {
-            AddSegment(row, CreateText(presentation.SubagentsText, presentation.SubagentsMaxWidth), ref hasContent);
-        }
-
-        if (presentation.ShowElapsed)
-        {
-            AddSegment(row, CreateText(FormatElapsed(_snapshot.Elapsed(DateTimeOffset.UtcNow)), 60), ref hasContent);
         }
 
         if (!hasContent)
         {
-            row.Children.Add(CreateText("Codex", 60));
+            row.Children.Add(CreateText("Codex", 60, presentation.TextFontSize));
         }
 
         _previewRoot.Child = row;
@@ -286,7 +310,7 @@ public sealed class MainPlugin : WidgetPluginBase, IConfigurableWidgetPlugin
         _previewLogicalWidth = Math.Clamp(
             (int)Math.Ceiling(row.DesiredSize.Width + horizontalChrome),
             96,
-            570);
+            700);
     }
 
     private void RenderFlyout()
@@ -333,14 +357,21 @@ public sealed class MainPlugin : WidgetPluginBase, IConfigurableWidgetPlugin
         AddDetail(_flyoutRoot, "Model", _snapshot.Model);
         AddDetail(_flyoutRoot, "Updated", FormatUpdatedAt(_snapshot.LastUpdatedAtUtc));
         AddDetail(_flyoutRoot, "Source", _snapshot.Source);
+        AddDetail(_flyoutRoot, "5-hour limit", FormatRateLimitDetail(_rateLimits.FiveHour));
+        AddDetail(_flyoutRoot, "Weekly limit", FormatRateLimitDetail(_rateLimits.Weekly));
+        AddDetail(_flyoutRoot, "Usage source", _rateLimitService.Source);
     }
 
-    private static TextBlock CreateText(string text, double maxWidth, Windows.UI.Color? color = null)
+    private static TextBlock CreateText(
+        string text,
+        double maxWidth,
+        double fontSize,
+        Windows.UI.Color? color = null)
     {
         return new TextBlock
         {
             Text = text,
-            FontSize = 12,
+            FontSize = fontSize,
             Foreground = new SolidColorBrush(color ?? Color("#FFE4E7EB")),
             MaxWidth = maxWidth,
             TextTrimming = TextTrimming.CharacterEllipsis,
@@ -348,16 +379,192 @@ public sealed class MainPlugin : WidgetPluginBase, IConfigurableWidgetPlugin
         };
     }
 
-    private Border CreateSpinner()
+    private StackPanel CreateActivitySegment(
+        PreviewIndicatorPresentation item,
+        PreviewPresentation presentation)
+    {
+        var segment = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = presentation.LeadingSpacing,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+
+        foreach (var leadingItem in item.LeadingItems)
+        {
+            if (leadingItem == PreviewLeadingItem.Spinner)
+            {
+                segment.Children.Add(CreateSpinner(presentation));
+            }
+            else
+            {
+                segment.Children.Add(CreateText(
+                    _snapshot.Activity,
+                    presentation.ActivityMaxWidth,
+                    presentation.TextFontSize,
+                    _snapshot.Status == "running" ? Colors.White : Color("#FFD1D6DC")));
+            }
+        }
+
+        return segment;
+    }
+
+    private StackPanel CreateUsageGroup(
+        PreviewPresentation presentation,
+        ref int itemIndex)
+    {
+        var group = new StackPanel
+        {
+            Orientation = Orientation.Vertical,
+            Spacing = Math.Max(1, presentation.UsageSpacing - 1),
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+
+        while (itemIndex < presentation.Items.Count &&
+               IsUsageIndicator(presentation.Items[itemIndex].Kind))
+        {
+            var kind = presentation.Items[itemIndex].Kind;
+            group.Children.Add(kind switch
+            {
+                PreviewIndicatorKind.FiveHourUsage => CreateUsageIndicator(
+                    "5h",
+                    "5-hour Codex limit",
+                    _rateLimits.FiveHour,
+                    presentation),
+                PreviewIndicatorKind.WeeklyUsage => CreateUsageIndicator(
+                    "w",
+                    "Weekly Codex limit",
+                    _rateLimits.Weekly,
+                    presentation),
+                _ => throw new InvalidOperationException("Unexpected usage indicator."),
+            });
+            itemIndex++;
+        }
+
+        itemIndex--;
+        AutomationProperties.SetName(group, "Codex usage limits");
+        return group;
+    }
+
+    private static StackPanel CreateUsageIndicator(
+        string shortLabel,
+        string accessibleLabel,
+        RateLimitWindowState state,
+        PreviewPresentation presentation)
+    {
+        var available = state.Availability == RateLimitAvailability.Available &&
+            state.RemainingPercent is { };
+        var remaining = available
+            ? Math.Clamp(state.RemainingPercent!.Value, 0d, 100d)
+            : 0d;
+        var color = state.Availability switch
+        {
+            RateLimitAvailability.Available when remaining <= 20d => Color("#FFFF6B6B"),
+            RateLimitAvailability.Available when remaining <= 50d => Color("#FFF5B942"),
+            RateLimitAvailability.Available => Color("#FF45D483"),
+            _ => Color("#FF7D8792"),
+        };
+
+        var fill = new Border
+        {
+            Width = Math.Max(0d, (presentation.BatteryWidth - 4d) * remaining / 100d),
+            Height = Math.Max(1d, presentation.BatteryHeight - 4d),
+            Margin = new Thickness(1),
+            HorizontalAlignment = HorizontalAlignment.Left,
+            VerticalAlignment = VerticalAlignment.Center,
+            Background = new SolidColorBrush(color),
+            CornerRadius = new CornerRadius(1),
+        };
+        var batteryBody = new Border
+        {
+            Width = presentation.BatteryWidth,
+            Height = presentation.BatteryHeight,
+            BorderBrush = new SolidColorBrush(color),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(2),
+            Child = fill,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        var terminal = new Border
+        {
+            Width = presentation.BatteryTerminalWidth,
+            Height = presentation.BatteryTerminalHeight,
+            Background = new SolidColorBrush(color),
+            CornerRadius = new CornerRadius(0, 1, 1, 0),
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        var battery = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 1,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        battery.Children.Add(batteryBody);
+        battery.Children.Add(terminal);
+
+        var roundedRemaining = (int)Math.Round(remaining, MidpointRounding.AwayFromZero);
+        var valueText = state.Availability switch
+        {
+            RateLimitAvailability.Available => $"{shortLabel} {roundedRemaining}%",
+            RateLimitAvailability.Disabled => $"{shortLabel} —",
+            _ => $"{shortLabel} ?",
+        };
+        var text = CreateText(
+            valueText,
+            presentation.UsageMaxWidth,
+            presentation.TextFontSize,
+            state.Availability == RateLimitAvailability.Available
+                ? Color("#FFE4E7EB")
+                : Color("#FF9AA3AD"));
+
+        var segment = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = presentation.UsageSpacing,
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            VerticalAlignment = VerticalAlignment.Center,
+            Opacity = state.Availability switch
+            {
+                RateLimitAvailability.Disabled => 0.42,
+                RateLimitAvailability.Unknown => 0.62,
+                _ => 1,
+            },
+        };
+        segment.Children.Add(battery);
+        segment.Children.Add(text);
+
+        var automationName = state.Availability switch
+        {
+            RateLimitAvailability.Available =>
+                $"{accessibleLabel}: {roundedRemaining} percent remaining" +
+                FormatResetForAutomation(state.ResetsAtUtc),
+            RateLimitAvailability.Disabled => $"{accessibleLabel}: disabled",
+            _ => $"{accessibleLabel}: unavailable",
+        };
+        AutomationProperties.SetName(segment, automationName);
+        return segment;
+    }
+
+    private static bool IsUsageIndicator(PreviewIndicatorKind kind) =>
+        kind is PreviewIndicatorKind.FiveHourUsage or PreviewIndicatorKind.WeeklyUsage;
+
+    private static string FormatResetForAutomation(DateTimeOffset? resetsAtUtc) =>
+        resetsAtUtc is { } reset
+            ? $", resets {reset.ToLocalTime():g}"
+            : string.Empty;
+
+    private Border CreateSpinner(PreviewPresentation presentation)
     {
         var frame = CurrentSpinnerFrame(DateTimeOffset.UtcNow)
             ?? throw new InvalidOperationException("An active request must have a spinner frame.");
         _spinnerText = new TextBlock
         {
             Text = frame.Text,
-            FontSize = 14,
+            FontSize = presentation.SpinnerFontSize,
             FontFamily = new FontFamily("Cascadia Mono"),
-            Foreground = new SolidColorBrush(StatusColor(_snapshot.Status)),
+            Foreground = new SolidColorBrush(Color(_settings.SpinnerColor)),
             TextAlignment = TextAlignment.Left,
             HorizontalAlignment = HorizontalAlignment.Stretch,
             VerticalAlignment = VerticalAlignment.Center,
@@ -365,8 +572,8 @@ public sealed class MainPlugin : WidgetPluginBase, IConfigurableWidgetPlugin
 
         var container = new Border
         {
-            Width = SpinnerContainerWidth(frame.Definition),
-            Height = 18,
+            Width = SpinnerContainerWidth(frame.Definition, presentation.SpinnerFontSize),
+            Height = presentation.SpinnerHeight,
             Child = _spinnerText,
             VerticalAlignment = VerticalAlignment.Center,
         };
@@ -374,11 +581,13 @@ public sealed class MainPlugin : WidgetPluginBase, IConfigurableWidgetPlugin
         return container;
     }
 
-    private static double SpinnerContainerWidth(AgentSpinnerDefinition definition)
+    private static double SpinnerContainerWidth(
+        AgentSpinnerDefinition definition,
+        double fontSize)
     {
         var characterCount = definition.Frames.Max(frame =>
             new System.Globalization.StringInfo(frame).LengthInTextElements);
-        return Math.Clamp((characterCount * 8.5) + 2, 12, 48);
+        return Math.Clamp((characterCount * fontSize * 0.61) + 2, 12, 48);
     }
 
     private AgentSpinnerFrame? CurrentSpinnerFrame(DateTimeOffset nowUtc) =>
@@ -486,7 +695,7 @@ public sealed class MainPlugin : WidgetPluginBase, IConfigurableWidgetPlugin
         string header,
         bool initialValue,
         Action<bool> apply,
-        WidgetSettings draft,
+        CodexWidgetSettings draft,
         IWidgetSettingsContext context)
     {
         var toggle = new ToggleSwitch
@@ -504,6 +713,252 @@ public sealed class MainPlugin : WidgetPluginBase, IConfigurableWidgetPlugin
             context.SaveSettings(draft.ToJson());
         };
 
+        AddSettingRow(panel, header, toggle);
+    }
+
+    private static void AddOrderedIndicatorRow(
+        Panel panel,
+        PreviewIndicatorKind indicator,
+        int index,
+        CodexWidgetSettings draft,
+        IWidgetSettingsContext context,
+        Action rerender)
+    {
+        var controls = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 4,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        var toggle = new ToggleSwitch
+        {
+            IsOn = GetIndicatorVisibility(draft, indicator),
+            OnContent = string.Empty,
+            OffContent = string.Empty,
+            HorizontalAlignment = HorizontalAlignment.Right,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        var label = IndicatorLabel(indicator);
+        AutomationProperties.SetName(toggle, $"Show {label}");
+        toggle.Toggled += (_, _) =>
+        {
+            SetIndicatorVisibility(draft, indicator, toggle.IsOn);
+            context.SaveSettings(draft.ToJson());
+        };
+
+        var earlier = CreateOrderButton("↑", $"Move {label} earlier", index > 0);
+        var later = CreateOrderButton(
+            "↓",
+            $"Move {label} later",
+            index < draft.IndicatorOrder.Count - 1);
+        earlier.Click += (_, _) =>
+        {
+            if (draft.MoveIndicator(indicator, -1))
+            {
+                context.SaveSettings(draft.ToJson());
+                rerender();
+            }
+        };
+        later.Click += (_, _) =>
+        {
+            if (draft.MoveIndicator(indicator, 1))
+            {
+                context.SaveSettings(draft.ToJson());
+                rerender();
+            }
+        };
+
+        controls.Children.Add(toggle);
+        controls.Children.Add(earlier);
+        controls.Children.Add(later);
+        AddSettingRow(panel, label, controls);
+    }
+
+    private static Button CreateOrderButton(string content, string automationName, bool enabled)
+    {
+        var button = new Button
+        {
+            Content = content,
+            Width = 28,
+            Height = 28,
+            MinWidth = 0,
+            Padding = new Thickness(0),
+            CornerRadius = new CornerRadius(4),
+            FontSize = 14,
+            IsEnabled = enabled,
+            HorizontalContentAlignment = HorizontalAlignment.Center,
+            VerticalContentAlignment = VerticalAlignment.Center,
+        };
+        AutomationProperties.SetName(button, automationName);
+        return button;
+    }
+
+    private static string IndicatorLabel(PreviewIndicatorKind indicator) => indicator switch
+    {
+        PreviewIndicatorKind.Activity => "Status / activity",
+        PreviewIndicatorKind.Files => "Changed files",
+        PreviewIndicatorKind.Subagents => "Subagents",
+        PreviewIndicatorKind.Elapsed => "Elapsed time",
+        PreviewIndicatorKind.FiveHourUsage => "5-hour usage",
+        PreviewIndicatorKind.WeeklyUsage => "Weekly usage",
+        _ => indicator.ToString(),
+    };
+
+    private static bool GetIndicatorVisibility(
+        CodexWidgetSettings settings,
+        PreviewIndicatorKind indicator) => indicator switch
+    {
+        PreviewIndicatorKind.Activity => settings.ShowActivity,
+        PreviewIndicatorKind.Files => settings.ShowFiles,
+        PreviewIndicatorKind.Subagents => settings.ShowAgents,
+        PreviewIndicatorKind.Elapsed => settings.ShowElapsed,
+        PreviewIndicatorKind.FiveHourUsage => settings.ShowFiveHourUsage,
+        PreviewIndicatorKind.WeeklyUsage => settings.ShowWeeklyUsage,
+        _ => false,
+    };
+
+    private static void SetIndicatorVisibility(
+        CodexWidgetSettings settings,
+        PreviewIndicatorKind indicator,
+        bool visible)
+    {
+        switch (indicator)
+        {
+            case PreviewIndicatorKind.Activity:
+                settings.ShowActivity = visible;
+                break;
+            case PreviewIndicatorKind.Files:
+                settings.ShowFiles = visible;
+                break;
+            case PreviewIndicatorKind.Subagents:
+                settings.ShowAgents = visible;
+                break;
+            case PreviewIndicatorKind.Elapsed:
+                settings.ShowElapsed = visible;
+                break;
+            case PreviewIndicatorKind.FiveHourUsage:
+                settings.ShowFiveHourUsage = visible;
+                break;
+            case PreviewIndicatorKind.WeeklyUsage:
+                settings.ShowWeeklyUsage = visible;
+                break;
+        }
+    }
+
+    private static void AddSpinnerColorSelector(
+        Panel panel,
+        CodexWidgetSettings draft,
+        IWidgetSettingsContext context)
+    {
+        var controls = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 4,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        var presetButtons = new List<(string Hex, ToggleButton Button)>();
+        foreach (var preset in SpinnerColorPresets)
+        {
+            var swatch = new Border
+            {
+                Width = 14,
+                Height = 14,
+                Background = new SolidColorBrush(Color(preset.Hex)),
+                BorderBrush = Brush("#80FFFFFF"),
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(7),
+            };
+            var button = new ToggleButton
+            {
+                Content = swatch,
+                Width = 24,
+                Height = 24,
+                MinWidth = 0,
+                Padding = new Thickness(2),
+                CornerRadius = new CornerRadius(5),
+                IsChecked = string.Equals(
+                    draft.SpinnerColor,
+                    preset.Hex,
+                    StringComparison.OrdinalIgnoreCase),
+                VerticalAlignment = VerticalAlignment.Center,
+            };
+            AutomationProperties.SetName(button, $"{preset.Name} spinner color, {preset.Hex}");
+            presetButtons.Add((preset.Hex, button));
+            controls.Children.Add(button);
+        }
+
+        var customInput = new TextBox
+        {
+            Text = draft.SpinnerColor,
+            Width = 80,
+            MinWidth = 0,
+            MaxLength = 7,
+            FontSize = 11,
+            Padding = new Thickness(5, 2, 5, 2),
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        AutomationProperties.SetName(customInput, "Custom spinner color in #RRGGBB format");
+        AutomationProperties.SetHelpText(customInput, "Enter a hexadecimal color such as #3B9EFF");
+        controls.Children.Add(customInput);
+
+        void ApplyColor(string value, bool save)
+        {
+            if (!CodexWidgetSettings.TryNormalizeSpinnerColor(value, out var normalized))
+            {
+                return;
+            }
+
+            var changed = !string.Equals(
+                draft.SpinnerColor,
+                normalized,
+                StringComparison.OrdinalIgnoreCase);
+            draft.SpinnerColor = normalized;
+            customInput.Text = normalized;
+            foreach (var presetButton in presetButtons)
+            {
+                presetButton.Button.IsChecked = string.Equals(
+                    presetButton.Hex,
+                    normalized,
+                    StringComparison.OrdinalIgnoreCase);
+            }
+
+            if (save && changed)
+            {
+                context.SaveSettings(draft.ToJson());
+            }
+        }
+
+        void CommitCustomColor()
+        {
+            if (CodexWidgetSettings.TryNormalizeSpinnerColor(customInput.Text, out var normalized))
+            {
+                ApplyColor(normalized, save: true);
+            }
+            else
+            {
+                customInput.Text = draft.SpinnerColor;
+            }
+        }
+
+        foreach (var presetButton in presetButtons)
+        {
+            presetButton.Button.Click += (_, _) => ApplyColor(presetButton.Hex, save: true);
+        }
+        customInput.KeyDown += (_, args) =>
+        {
+            if (args.Key == Windows.System.VirtualKey.Enter)
+            {
+                CommitCustomColor();
+                args.Handled = true;
+            }
+        };
+        customInput.LostFocus += (_, _) => CommitCustomColor();
+
+        AddSettingRow(panel, "Spinner color", controls);
+    }
+
+    private static void AddSettingRow(Panel panel, string header, FrameworkElement control)
+    {
         var row = new Grid
         {
             MinHeight = 44,
@@ -517,8 +972,8 @@ public sealed class MainPlugin : WidgetPluginBase, IConfigurableWidgetPlugin
             VerticalAlignment = VerticalAlignment.Center,
             TextTrimming = TextTrimming.CharacterEllipsis,
         });
-        Grid.SetColumn(toggle, 1);
-        row.Children.Add(toggle);
+        Grid.SetColumn(control, 1);
+        row.Children.Add(control);
 
         panel.Children.Add(new Border
         {
@@ -529,6 +984,22 @@ public sealed class MainPlugin : WidgetPluginBase, IConfigurableWidgetPlugin
             Padding = new Thickness(10, 4, 8, 4),
             Child = row,
         });
+    }
+
+    private static void ConfigureSettingsWindowMinimumSize(FrameworkElement root)
+    {
+        if (root.XamlRoot is null)
+        {
+            return;
+        }
+
+        var appWindow = AppWindow.GetFromWindowId(
+            root.XamlRoot.ContentIslandEnvironment.AppWindowId);
+        if (appWindow?.Presenter is OverlappedPresenter presenter)
+        {
+            presenter.PreferredMinimumWidth = 800;
+            presenter.PreferredMinimumHeight = 480;
+        }
     }
 
     private static Border CreateSettingsCard(string title, UIElement content)
@@ -553,14 +1024,18 @@ public sealed class MainPlugin : WidgetPluginBase, IConfigurableWidgetPlugin
         };
     }
 
-    private static void AddSegment(StackPanel row, UIElement element, ref bool hasContent)
+    private static void AddSegment(
+        StackPanel row,
+        UIElement element,
+        double separatorHeight,
+        ref bool hasContent)
     {
         if (hasContent)
         {
             row.Children.Add(new Border
             {
                 Width = 1,
-                Height = 16,
+                Height = separatorHeight,
                 Background = Brush("#553C424A"),
                 VerticalAlignment = VerticalAlignment.Center,
             });
@@ -568,18 +1043,6 @@ public sealed class MainPlugin : WidgetPluginBase, IConfigurableWidgetPlugin
 
         row.Children.Add(element);
         hasContent = true;
-    }
-
-    private static Windows.UI.Color StatusColor(string? status)
-    {
-        return status?.ToLowerInvariant() switch
-        {
-            "running" => Color("#FF3B9EFF"),
-            "waiting" => Color("#FFF2B84B"),
-            "completed" => Color("#FF54D38A"),
-            "error" or "aborted" => Color("#FFFF6B72"),
-            _ => Color("#FF98A2AD"),
-        };
     }
 
     private static bool IsActive(string? status) =>
@@ -597,6 +1060,25 @@ public sealed class MainPlugin : WidgetPluginBase, IConfigurableWidgetPlugin
 
     private static string FormatUpdatedAt(DateTimeOffset? timestamp) =>
         timestamp?.ToLocalTime().ToString("HH:mm:ss") ?? "—";
+
+    private static string FormatRateLimitDetail(RateLimitWindowState state)
+    {
+        if (state.Availability == RateLimitAvailability.Disabled)
+        {
+            return "Disabled";
+        }
+
+        if (state.Availability != RateLimitAvailability.Available ||
+            state.RemainingPercent is not { } remaining)
+        {
+            return "Unavailable";
+        }
+
+        var value = $"{Math.Round(remaining, MidpointRounding.AwayFromZero):0}% remaining";
+        return state.ResetsAtUtc is { } reset
+            ? $"{value} · resets {reset.ToLocalTime():ddd HH:mm}"
+            : value;
+    }
 
     private static string ProjectName(string? cwd)
     {
@@ -623,30 +1105,4 @@ public sealed class MainPlugin : WidgetPluginBase, IConfigurableWidgetPlugin
             (byte)argb);
     }
 
-    private sealed class WidgetSettings
-    {
-        public bool ShowActivity { get; set; } = true;
-        public bool ShowFiles { get; set; } = true;
-        public bool ShowAgents { get; set; } = true;
-        public bool ShowElapsed { get; set; } = true;
-        public bool ShowPulse { get; set; } = true;
-        public bool Compact { get; set; }
-        public bool HideWhenIdle { get; set; }
-
-        public static WidgetSettings FromJson(string? json)
-        {
-            try
-            {
-                return string.IsNullOrWhiteSpace(json)
-                    ? new WidgetSettings()
-                    : JsonSerializer.Deserialize<WidgetSettings>(json, JsonOptions) ?? new WidgetSettings();
-            }
-            catch (JsonException)
-            {
-                return new WidgetSettings();
-            }
-        }
-
-        public string ToJson() => JsonSerializer.Serialize(this, JsonOptions);
-    }
 }
