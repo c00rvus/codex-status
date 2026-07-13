@@ -69,24 +69,24 @@ public sealed class HookEventProcessor
             case "sessionstart":
                 ResetExecution(state);
                 state.Status = CodexExecutionStatuses.Running;
-                state.Activity = "Iniciando sessão";
+                state.Activity = CodexActivityLabels.StartingSession;
                 state.StartedAtUtc = now;
                 break;
 
             case "userpromptsubmit":
                 ResetTurn(state);
                 state.Status = CodexExecutionStatuses.Running;
-                state.Activity = "Processando solicitação";
+                state.Activity = CodexActivityLabels.ProcessingRequest;
                 state.StartedAtUtc = now;
                 break;
 
             case "pretooluse":
                 state.Status = CodexExecutionStatuses.Running;
                 state.WaitingSinceAtUtc = null;
-                state.CurrentTool = ReadToolName(root) ?? "ferramenta";
+                state.CurrentTool = ReadToolName(root) ?? "tool";
                 state.Activity = IsApplyPatch(state.CurrentTool)
-                    ? "Aplicando alterações"
-                    : $"Executando {state.CurrentTool}";
+                    ? CodexActivityLabels.ApplyingChanges
+                    : CodexActivityLabels.RunningTool(state.CurrentTool);
                 state.ToolCount++;
                 state.LastToolAtUtc = now;
                 AddPatchFiles(state, root, state.CurrentTool);
@@ -94,14 +94,14 @@ public sealed class HookEventProcessor
 
             case "permissionrequest":
                 state.Status = CodexExecutionStatuses.Waiting;
-                state.Activity = "Aguardando permissão";
+                state.Activity = CodexActivityLabels.WaitingForPermission;
                 state.CurrentTool = ReadToolName(root) ?? state.CurrentTool;
                 state.WaitingSinceAtUtc = now;
                 break;
 
             case "posttooluse":
                 state.Status = CodexExecutionStatuses.Running;
-                state.Activity = "Processando resultado";
+                state.Activity = CodexActivityLabels.ProcessingResult;
                 state.WaitingSinceAtUtc = null;
                 var completedTool = ReadToolName(root) ?? state.CurrentTool;
                 AddPatchFiles(state, root, completedTool);
@@ -110,14 +110,14 @@ public sealed class HookEventProcessor
 
             case "subagentstart":
                 state.Status = CodexExecutionStatuses.Running;
-                state.Activity = "Executando subagente";
+                state.Activity = CodexActivityLabels.RunningSubagent;
                 state.ActiveSubagents++;
                 state.TotalSubagents++;
                 break;
 
             case "subagentstop":
                 state.Status = CodexExecutionStatuses.Running;
-                state.Activity = "Processando resultado do subagente";
+                state.Activity = CodexActivityLabels.ProcessingSubagentResult;
                 state.ActiveSubagents = Math.Max(0, state.ActiveSubagents - 1);
                 break;
 
@@ -146,7 +146,7 @@ public sealed class HookEventProcessor
             || normalizedReason.Contains("fail", StringComparison.Ordinal))
         {
             state.Status = CodexExecutionStatuses.Error;
-            state.Activity = "Erro";
+            state.Activity = CodexActivityLabels.Error;
             state.ErrorMessage = error ?? reason;
         }
         else if (normalizedReason.Contains("abort", StringComparison.Ordinal)
@@ -154,13 +154,13 @@ public sealed class HookEventProcessor
             || normalizedReason.Contains("interrupt", StringComparison.Ordinal))
         {
             state.Status = CodexExecutionStatuses.Aborted;
-            state.Activity = "Interrompido";
+            state.Activity = CodexActivityLabels.Interrupted;
             state.ErrorMessage = null;
         }
         else
         {
             state.Status = CodexExecutionStatuses.Completed;
-            state.Activity = "Concluído";
+            state.Activity = CodexActivityLabels.Completed;
             state.ErrorMessage = null;
         }
     }

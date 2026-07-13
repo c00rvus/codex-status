@@ -23,7 +23,7 @@
   <PropertyGroup>
     <WidBarPluginId>com.wille.codex.taskbarstatus</WidBarPluginId>
     <WidBarPluginName>Codex Status</WidBarPluginName>
-    <WidBarPluginDescription>Status local das execucoes do Codex na barra de tarefas.</WidBarPluginDescription>
+    <WidBarPluginDescription>Local Codex execution status in the taskbar.</WidBarPluginDescription>
     <WidBarPluginCategory>Developer</WidBarPluginCategory>
     <WidBarPluginVersion>1.0.0</WidBarPluginVersion>
     <WidBarPluginPreviewWidth>400</WidBarPluginPreviewWidth>

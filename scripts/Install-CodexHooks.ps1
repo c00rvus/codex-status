@@ -76,13 +76,31 @@ foreach ($event in $events) {
 
     $alreadyInstalled = $false
     foreach ($group in $groups) {
-        foreach ($handler in @($group.hooks)) {
-            if ($handler.commandWindows -like '*Codex.TaskbarStatus.Bridge.exe*' -or
-                $handler.command -like '*Codex.TaskbarStatus.Bridge.exe*') {
+        $handlersProperty = $group.PSObject.Properties['hooks']
+        if (-not $handlersProperty) {
+            continue
+        }
+
+        foreach ($handler in @($handlersProperty.Value)) {
+            $commandWindowsProperty = $handler.PSObject.Properties['commandWindows']
+            $commandProperty = $handler.PSObject.Properties['command']
+            $isCodexStatusHandler =
+                ($commandWindowsProperty -and $commandWindowsProperty.Value -like '*Codex.TaskbarStatus.Bridge.exe*') -or
+                ($commandProperty -and $commandProperty.Value -like '*Codex.TaskbarStatus.Bridge.exe*')
+            if ($isCodexStatusHandler) {
                 $alreadyInstalled = $true
-                $handler.command = $command
-                $handler.commandWindows = $command
-                $handler.timeout = 3
+                foreach ($setting in @{
+                    command = $command
+                    commandWindows = $command
+                    timeout = 3
+                }.GetEnumerator()) {
+                    $settingProperty = $handler.PSObject.Properties[$setting.Key]
+                    if ($settingProperty) {
+                        $settingProperty.Value = $setting.Value
+                    } else {
+                        $handler | Add-Member -MemberType NoteProperty -Name $setting.Key -Value $setting.Value
+                    }
+                }
             }
         }
     }

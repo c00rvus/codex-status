@@ -16,7 +16,7 @@ public sealed record CodexExecutionState
 
     public string Status { get; set; } = CodexExecutionStatuses.Idle;
 
-    public string Activity { get; set; } = "Aguardando";
+    public string Activity { get; set; } = CodexActivityLabels.Waiting;
 
     public string? SessionId { get; set; }
 

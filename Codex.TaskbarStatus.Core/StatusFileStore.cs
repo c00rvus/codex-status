@@ -186,9 +186,7 @@ public sealed class StatusFileStore
         state.Status = string.IsNullOrWhiteSpace(state.Status)
             ? CodexExecutionStatuses.Idle
             : state.Status;
-        state.Activity = string.IsNullOrWhiteSpace(state.Activity)
-            ? "Aguardando"
-            : state.Activity;
+        state.Activity = CodexActivityLabels.ToEnglish(state.Activity);
         return state;
     }
 

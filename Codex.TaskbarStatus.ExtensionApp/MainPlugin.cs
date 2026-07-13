@@ -32,7 +32,7 @@ public sealed class MainPlugin : WidgetPluginBase, IConfigurableWidgetPlugin
 
     public override string Id => "com.wille.codex.taskbarstatus";
     public override string Name => "Codex Status";
-    public override string Description => "Status local das execuções do Codex na barra de tarefas.";
+    public override string Description => "Local Codex execution status in the taskbar.";
     public override WidgetCategory Category => WidgetCategory.Developer;
 
     public override int PreviewLogicalWidth => _previewLogicalWidth;
@@ -59,7 +59,7 @@ public sealed class MainPlugin : WidgetPluginBase, IConfigurableWidgetPlugin
             VerticalAlignment = VerticalAlignment.Center,
         };
 
-        AutomationProperties.SetName(_previewRoot, "Status da execução do Codex");
+        AutomationProperties.SetName(_previewRoot, "Codex execution status");
         RenderPreview();
         EnsureTimers();
 
@@ -111,18 +111,18 @@ public sealed class MainPlugin : WidgetPluginBase, IConfigurableWidgetPlugin
         cards.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
 
         var displayedOptions = new StackPanel { Spacing = 6 };
-        AddToggle(displayedOptions, "Status / atividade", draft.ShowActivity, value => draft.ShowActivity = value, draft, context);
-        AddToggle(displayedOptions, "Arquivos alterados", draft.ShowFiles, value => draft.ShowFiles = value, draft, context);
-        AddToggle(displayedOptions, "Agentes paralelos", draft.ShowAgents, value => draft.ShowAgents = value, draft, context);
-        AddToggle(displayedOptions, "Tempo decorrido", draft.ShowElapsed, value => draft.ShowElapsed = value, draft, context);
+        AddToggle(displayedOptions, "Status / activity", draft.ShowActivity, value => draft.ShowActivity = value, draft, context);
+        AddToggle(displayedOptions, "Changed files", draft.ShowFiles, value => draft.ShowFiles = value, draft, context);
+        AddToggle(displayedOptions, "Subagents", draft.ShowAgents, value => draft.ShowAgents = value, draft, context);
+        AddToggle(displayedOptions, "Elapsed time", draft.ShowElapsed, value => draft.ShowElapsed = value, draft, context);
 
         var behaviorOptions = new StackPanel { Spacing = 6 };
-        AddToggle(behaviorOptions, "Spinner animado", draft.ShowPulse, value => draft.ShowPulse = value, draft, context);
-        AddToggle(behaviorOptions, "Modo compacto", draft.Compact, value => draft.Compact = value, draft, context);
-        AddToggle(behaviorOptions, "Ocultar quando ocioso", draft.HideWhenIdle, value => draft.HideWhenIdle = value, draft, context);
+        AddToggle(behaviorOptions, "Animated spinner", draft.ShowPulse, value => draft.ShowPulse = value, draft, context);
+        AddToggle(behaviorOptions, "Compact mode", draft.Compact, value => draft.Compact = value, draft, context);
+        AddToggle(behaviorOptions, "Hide when idle", draft.HideWhenIdle, value => draft.HideWhenIdle = value, draft, context);
 
-        var displayedCard = CreateSettingsCard("Elementos exibidos", displayedOptions);
-        var behaviorCard = CreateSettingsCard("Animação e comportamento", behaviorOptions);
+        var displayedCard = CreateSettingsCard("Displayed items", displayedOptions);
+        var behaviorCard = CreateSettingsCard("Animation and behavior", behaviorOptions);
         Grid.SetColumn(behaviorCard, 1);
         cards.Children.Add(displayedCard);
         cards.Children.Add(behaviorCard);
@@ -130,7 +130,7 @@ public sealed class MainPlugin : WidgetPluginBase, IConfigurableWidgetPlugin
 
         var attributionLink = new HyperlinkButton
         {
-            Content = "Spinners por Eronred/expo-agent-spinners (MIT)",
+            Content = "Spinners by Eronred/expo-agent-spinners (MIT)",
             NavigateUri = new Uri("https://github.com/Eronred/expo-agent-spinners"),
             FontSize = 12,
             Opacity = 0.72,
@@ -141,7 +141,7 @@ public sealed class MainPlugin : WidgetPluginBase, IConfigurableWidgetPlugin
         };
         AutomationProperties.SetName(
             attributionLink,
-            "Abrir repositório Eronred expo-agent-spinners");
+            "Open the Eronred expo-agent-spinners repository");
         Grid.SetRow(attributionLink, 1);
         root.Children.Add(attributionLink);
 
@@ -219,8 +219,18 @@ public sealed class MainPlugin : WidgetPluginBase, IConfigurableWidgetPlugin
 
         var hasContent = false;
 
-        var showSpinner = _settings.ShowPulse && IsActive(_snapshot.Status);
-        if (_settings.ShowActivity || showSpinner)
+        var presentation = PreviewPresentationFactory.Create(
+            _settings.ShowActivity,
+            _settings.ShowFiles,
+            _settings.ShowAgents,
+            _settings.ShowElapsed,
+            _settings.ShowPulse,
+            IsActive(_snapshot.Status),
+            _settings.Compact,
+            _snapshot.FilesChangedCount,
+            _snapshot.TotalSubagents);
+
+        if (presentation.ShowActivity || presentation.ShowSpinner)
         {
             var activitySegment = new StackPanel
             {
@@ -229,15 +239,15 @@ public sealed class MainPlugin : WidgetPluginBase, IConfigurableWidgetPlugin
                 VerticalAlignment = VerticalAlignment.Center,
             };
 
-            if (_settings.ShowActivity)
+            if (presentation.ShowActivity)
             {
                 activitySegment.Children.Add(CreateText(
                     _snapshot.Activity,
-                    _settings.Compact ? 92 : 148,
+                    presentation.ActivityMaxWidth,
                     _snapshot.Status == "running" ? Colors.White : Color("#FFD1D6DC")));
             }
 
-            if (showSpinner)
+            if (presentation.ShowSpinner)
             {
                 activitySegment.Children.Add(CreateSpinner());
             }
@@ -245,19 +255,17 @@ public sealed class MainPlugin : WidgetPluginBase, IConfigurableWidgetPlugin
             AddSegment(row, activitySegment, ref hasContent);
         }
 
-        if (_settings.ShowFiles && !_settings.Compact)
+        if (presentation.FilesText is not null)
         {
-            AddSegment(row, CreateText(
-                $"{_snapshot.FilesChangedCount} {Plural(_snapshot.FilesChangedCount, "arquivo", "arquivos")}", 86), ref hasContent);
+            AddSegment(row, CreateText(presentation.FilesText, presentation.FilesMaxWidth), ref hasContent);
         }
 
-        if (_settings.ShowAgents && !_settings.Compact && _snapshot.TotalSubagents > 0)
+        if (presentation.SubagentsText is not null)
         {
-            AddSegment(row, CreateText(
-                $"{_snapshot.TotalSubagents} {Plural(_snapshot.TotalSubagents, "agente", "agentes")}", 78), ref hasContent);
+            AddSegment(row, CreateText(presentation.SubagentsText, presentation.SubagentsMaxWidth), ref hasContent);
         }
 
-        if (_settings.ShowElapsed)
+        if (presentation.ShowElapsed)
         {
             AddSegment(row, CreateText(FormatElapsed(_snapshot.Elapsed(DateTimeOffset.UtcNow)), 60), ref hasContent);
         }
@@ -316,15 +324,15 @@ public sealed class MainPlugin : WidgetPluginBase, IConfigurableWidgetPlugin
         metrics.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         metrics.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         metrics.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        metrics.Children.Add(CreateMetric("Tempo", FormatElapsed(_snapshot.Elapsed(DateTimeOffset.UtcNow)), 0, 0));
-        metrics.Children.Add(CreateMetric("Arquivos", _snapshot.FilesChangedCount.ToString(), 0, 1));
-        metrics.Children.Add(CreateMetric("Agentes", _snapshot.TotalSubagents.ToString(), 0, 2));
+        metrics.Children.Add(CreateMetric("Elapsed", FormatElapsed(_snapshot.Elapsed(DateTimeOffset.UtcNow)), 0, 0));
+        metrics.Children.Add(CreateMetric("Files", _snapshot.FilesChangedCount.ToString(), 0, 1));
+        metrics.Children.Add(CreateMetric("Subagents", _snapshot.TotalSubagents.ToString(), 0, 2));
         _flyoutRoot.Children.Add(metrics);
 
-        AddDetail(_flyoutRoot, "Projeto", ProjectName(_snapshot.Cwd));
-        AddDetail(_flyoutRoot, "Modelo", _snapshot.Model);
-        AddDetail(_flyoutRoot, "Atualizado", FormatUpdatedAt(_snapshot.LastUpdatedAtUtc));
-        AddDetail(_flyoutRoot, "Fonte", _snapshot.Source);
+        AddDetail(_flyoutRoot, "Project", ProjectName(_snapshot.Cwd));
+        AddDetail(_flyoutRoot, "Model", _snapshot.Model);
+        AddDetail(_flyoutRoot, "Updated", FormatUpdatedAt(_snapshot.LastUpdatedAtUtc));
+        AddDetail(_flyoutRoot, "Source", _snapshot.Source);
     }
 
     private static TextBlock CreateText(string text, double maxWidth, Windows.UI.Color? color = null)
@@ -599,9 +607,6 @@ public sealed class MainPlugin : WidgetPluginBase, IConfigurableWidgetPlugin
 
         return Path.GetFileName(cwd.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
     }
-
-    private static string Plural(int count, string singular, string plural) =>
-        count == 1 ? singular : plural;
 
     private static SolidColorBrush Brush(string hex) => new(Color(hex));
 

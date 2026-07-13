@@ -94,7 +94,7 @@ public sealed class HookEventProcessorTests : IDisposable
             """);
 
         Assert.Equal(CodexExecutionStatuses.Waiting, state.Status);
-        Assert.Equal("Aguardando permissão", state.Activity);
+        Assert.Equal(CodexActivityLabels.WaitingForPermission, state.Activity);
         Assert.Equal("shell_command", state.CurrentTool);
         Assert.Equal(Now, state.WaitingSinceAtUtc);
     }
@@ -106,7 +106,7 @@ public sealed class HookEventProcessorTests : IDisposable
         var state = await _processor.ProcessAsync("""{"hook_event_name":"Stop"}""");
 
         Assert.Equal(CodexExecutionStatuses.Completed, state.Status);
-        Assert.Equal("Concluído", state.Activity);
+        Assert.Equal(CodexActivityLabels.Completed, state.Activity);
         Assert.Equal(Now, state.StoppedAtUtc);
         Assert.Null(state.CurrentTool);
         Assert.Null(state.WaitingSinceAtUtc);

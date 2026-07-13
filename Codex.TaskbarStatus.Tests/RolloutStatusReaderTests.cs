@@ -69,7 +69,7 @@ public sealed class RolloutStatusReaderTests : IDisposable
         Assert.Equal("active-thread", state.SessionId);
         Assert.Equal("active-turn", state.TurnId);
         Assert.Equal(CodexExecutionStatuses.Running, state.Status);
-        Assert.Equal("Gerando resposta", state.Activity);
+        Assert.Equal(CodexActivityLabels.GeneratingResponse, state.Activity);
         Assert.Equal(DateTimeOffset.Parse("2026-07-13T04:00:01Z"), state.StartedAtUtc);
     }
 

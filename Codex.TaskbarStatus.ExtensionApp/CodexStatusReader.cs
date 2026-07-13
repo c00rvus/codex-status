@@ -5,7 +5,7 @@ namespace Codex.TaskbarStatus.ExtensionApp;
 internal sealed class CodexStatusSnapshot
 {
     public string Status { get; init; } = CodexExecutionStatuses.Idle;
-    public string Activity { get; init; } = "Nenhuma execução ativa";
+    public string Activity { get; init; } = CodexActivityLabels.NoActiveExecution;
     public string? SessionId { get; init; }
     public string? TurnId { get; init; }
     public string? Cwd { get; init; }
@@ -16,7 +16,7 @@ internal sealed class CodexStatusSnapshot
     public DateTimeOffset? StartedAtUtc { get; init; }
     public DateTimeOffset? StoppedAtUtc { get; init; }
     public DateTimeOffset LastUpdatedAtUtc { get; init; } = DateTimeOffset.MinValue;
-    public string Source { get; init; } = "none";
+    public string Source { get; init; } = "None";
 
     public TimeSpan Elapsed(DateTimeOffset now)
     {
@@ -59,29 +59,29 @@ internal sealed class CodexStatusReader
     {
         if (hookState is null)
         {
-            source = rolloutState is null ? "none" : "sessão local (fallback)";
+            source = rolloutState is null ? "None" : "Local session (fallback)";
             return rolloutState;
         }
 
         if (rolloutState is null)
         {
-            source = "hooks";
+            source = "Hooks";
             return hookState;
         }
 
         if (string.Equals(hookState.SessionId, rolloutState.SessionId, StringComparison.Ordinal))
         {
-            source = "hooks + sessão local";
+            source = "Hooks + local session";
             return Merge(hookState, rolloutState);
         }
 
         if (rolloutState.LastUpdatedAtUtc > hookState.LastUpdatedAtUtc)
         {
-            source = "sessão local (fallback)";
+            source = "Local session (fallback)";
             return rolloutState;
         }
 
-        source = "hooks";
+        source = "Hooks";
         return hookState;
     }
 
@@ -129,7 +129,7 @@ internal sealed class CodexStatusReader
         return new CodexStatusSnapshot
         {
             Status = state.Status,
-            Activity = state.Activity,
+            Activity = CodexActivityLabels.ToEnglish(state.Activity),
             SessionId = state.SessionId,
             TurnId = state.TurnId,
             Cwd = state.Cwd,

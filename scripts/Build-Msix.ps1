@@ -1,23 +1,40 @@
 [CmdletBinding()]
 param(
     [ValidateSet('Debug', 'Release')]
-    [string]$Configuration = 'Release'
+    [string]$Configuration = 'Release',
+    [switch]$CheckOnly
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-& (Join-Path $PSScriptRoot 'Build-Local.ps1') -Configuration $Configuration -Platform x64
+$programFilesX86 = [Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
+if ([string]::IsNullOrWhiteSpace($programFilesX86)) {
+    throw 'The x86 Program Files location could not be detected. Install a current Windows 10/11 SDK or use Developer Mode.'
+}
+$sdkRoot = Join-Path $programFilesX86 'Windows Kits\10\bin'
+if (-not (Test-Path $sdkRoot)) {
+    throw 'Windows SDK MakeAppx and SignTool were not found. Install a current Windows 10/11 SDK or use Developer Mode.'
+}
 
-$sdkRoot = 'C:\Program Files (x86)\Windows Kits\10\bin'
 $sdkBin = Get-ChildItem $sdkRoot -Directory |
-    Where-Object { Test-Path (Join-Path $_.FullName 'x64\makeappx.exe') } |
+    Where-Object {
+        (Test-Path (Join-Path $_.FullName 'x64\makeappx.exe')) -and
+        (Test-Path (Join-Path $_.FullName 'x64\signtool.exe'))
+    } |
     Sort-Object { [version]$_.Name } -Descending |
     Select-Object -First 1
 if (-not $sdkBin) {
-    throw 'Windows SDK MakeAppx and SignTool were not found.'
+    throw 'Windows SDK MakeAppx and SignTool were not found. Install a current Windows 10/11 SDK or use Developer Mode.'
 }
+
+if ($CheckOnly) {
+    Write-Host "Windows SDK tools ready: $($sdkBin.Name)"
+    return
+}
+
+& (Join-Path $PSScriptRoot 'Build-Local.ps1') -Configuration $Configuration -Platform x64
 
 $makeAppx = Join-Path $sdkBin.FullName 'x64\makeappx.exe'
 $signTool = Join-Path $sdkBin.FullName 'x64\signtool.exe'

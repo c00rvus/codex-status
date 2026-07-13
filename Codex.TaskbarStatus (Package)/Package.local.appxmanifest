@@ -40,7 +40,7 @@
       EntryPoint="Windows.FullTrustApplication">
       <uap:VisualElements
         DisplayName="Codex Status"
-        Description="Status local das execuções do Codex na barra de tarefas."
+        Description="Local Codex execution status in the taskbar."
         BackgroundColor="transparent"
         Square150x150Logo="Images\MediumTile.png"
         Square44x44Logo="Images\AppIcon.png">
@@ -56,7 +56,7 @@
             Id="widget"
             PublicFolder="Public"
             DisplayName="Codex Status"
-            Description="Status local das execuções do Codex na barra de tarefas.">
+            Description="Local Codex execution status in the taskbar.">
             <uap3:Properties>
               <WidBarPluginId>com.wille.codex.taskbarstatus</WidBarPluginId>
               <WidBarSdkVersion>2</WidBarSdkVersion>

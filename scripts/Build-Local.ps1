@@ -13,7 +13,9 @@ $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $project = Join-Path $root 'Codex.TaskbarStatus.ExtensionApp\Codex.TaskbarStatus.ExtensionApp.csproj'
 $packageRoot = Join-Path $root 'Codex.TaskbarStatus (Package)'
 $artifacts = Join-Path $root 'artifacts'
-$layout = Join-Path $artifacts 'layout'
+$targetLayout = Join-Path $artifacts 'layout'
+$layout = Join-Path $artifacts ".layout-staging-$([Guid]::NewGuid().ToString('N'))"
+$backupLayout = Join-Path $artifacts ".layout-backup-$([Guid]::NewGuid().ToString('N'))"
 
 # The loose package runs directly from this folder. Stop only our plugin before
 # replacing its assemblies so a later reinstall is safe while WidBar is open.
@@ -23,85 +25,107 @@ if ($pluginProcesses.Count -gt 0) {
     $pluginProcesses | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
 }
 
-if (Test-Path $layout) {
-    $resolvedLayout = (Resolve-Path $layout).Path
-    $resolvedRoot = (Resolve-Path $root).Path
-    if (-not $resolvedLayout.StartsWith($resolvedRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
-        throw "Refusing to clean a layout outside the repository: $resolvedLayout"
+try {
+    New-Item -ItemType Directory -Path $layout -Force | Out-Null
+
+    dotnet publish $project `
+        --configuration $Configuration `
+        --runtime "win-$Platform" `
+        --self-contained true `
+        --output $layout `
+        -p:Platform=$Platform
+    if ($LASTEXITCODE -ne 0) {
+        throw "Widget publish failed with exit code $LASTEXITCODE."
     }
-    for ($attempt = 1; $attempt -le 12; $attempt++) {
+
+    $pluginManifest = Join-Path (Split-Path $project) 'obj\widbar\plugin.json'
+    if (-not (Test-Path $pluginManifest)) {
+        throw "WidBar plugin manifest was not generated: $pluginManifest"
+    }
+
+    $public = Join-Path $layout 'Public'
+    $images = Join-Path $layout 'Images'
+    New-Item -ItemType Directory -Path $public -Force | Out-Null
+    New-Item -ItemType Directory -Path $images -Force | Out-Null
+    Copy-Item -LiteralPath $pluginManifest -Destination (Join-Path $public 'plugin.json') -Force
+    Copy-Item -Path (Join-Path $packageRoot 'Images\*.png') -Destination $images -Force
+    Copy-Item -LiteralPath (Join-Path $root 'THIRD_PARTY_NOTICES.md') `
+        -Destination (Join-Path $layout 'THIRD_PARTY_NOTICES.md') -Force
+    $baseImages = @('AppIcon', 'StoreLogo', 'SmallTile', 'MediumTile', 'WideTile', 'LargeTile')
+    foreach ($baseImage in $baseImages) {
+        Copy-Item -LiteralPath (Join-Path $images "$baseImage.scale-100.png") `
+            -Destination (Join-Path $images "$baseImage.png") -Force
+    }
+    $layoutManifest = Join-Path $layout 'AppxManifest.xml'
+    Copy-Item -LiteralPath (Join-Path $packageRoot 'Package.local.appxmanifest') `
+        -Destination $layoutManifest -Force
+
+    # x-generate is a packaging-project placeholder. Unlike MSBuild packaging,
+    # loose Appx registration does not replace it and Windows rejects the manifest.
+    [xml]$manifestXml = Get-Content -LiteralPath $layoutManifest -Raw
+    $resourceLanguages = @($manifestXml.Package.Resources.Resource | ForEach-Object Language)
+    if (-not $resourceLanguages -or $resourceLanguages -contains 'x-generate') {
+        throw 'The local Appx manifest must contain a concrete resource language (for example en-US).'
+    }
+
+    $required = @(
+        'AppxManifest.xml',
+        'Codex.TaskbarStatus.ExtensionApp.exe',
+        'coreclr.dll',
+        'hostfxr.dll',
+        'hostpolicy.dll',
+        'THIRD_PARTY_NOTICES.md',
+        'Public\plugin.json',
+        'Images\AppIcon.scale-100.png'
+    )
+    foreach ($relativePath in $required) {
+        if (-not (Test-Path (Join-Path $layout $relativePath))) {
+            throw "Local package layout is incomplete: $relativePath"
+        }
+    }
+} catch {
+    if (Test-Path $layout) {
+        Remove-Item -LiteralPath $layout -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    throw
+}
+
+$previousLayoutMoved = $false
+try {
+    if (Test-Path $targetLayout) {
+        Move-Item -LiteralPath $targetLayout -Destination $backupLayout -ErrorAction Stop
+        $previousLayoutMoved = $true
+    }
+    Move-Item -LiteralPath $layout -Destination $targetLayout -ErrorAction Stop
+} catch {
+    $swapError = $_.Exception.Message
+    if ($previousLayoutMoved -and (Test-Path $backupLayout)) {
         try {
-            Remove-Item -LiteralPath $resolvedLayout -Recurse -Force -ErrorAction Stop
-            break
-        }
-        catch [System.UnauthorizedAccessException], [System.IO.IOException] {
-            if ($attempt -eq 12) {
-                throw
+            if (Test-Path $targetLayout) {
+                Remove-Item -LiteralPath $targetLayout -Recurse -Force -ErrorAction Stop
             }
-
-            # A just-terminated self-contained .NET process can retain native
-            # module handles for a brief moment while Windows tears it down.
-            Start-Sleep -Milliseconds 250
+            Move-Item -LiteralPath $backupLayout -Destination $targetLayout -ErrorAction Stop
+        } catch {
+            throw "Failed to activate the new layout and failed to restore the previous one: $($_.Exception.Message). Original error: $swapError"
         }
     }
+    if (Test-Path $layout) {
+        Remove-Item -LiteralPath $layout -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    $recoveryMessage = if ($previousLayoutMoved) {
+        'The previous layout was restored.'
+    } else {
+        'No previous layout was changed.'
+    }
+    throw "Failed to activate the new layout. $recoveryMessage Original error: $swapError"
 }
 
-New-Item -ItemType Directory -Path $layout -Force | Out-Null
-
-dotnet publish $project `
-    --configuration $Configuration `
-    --runtime "win-$Platform" `
-    --self-contained true `
-    --output $layout `
-    -p:Platform=$Platform
-if ($LASTEXITCODE -ne 0) {
-    throw "Widget publish failed with exit code $LASTEXITCODE."
-}
-
-$pluginManifest = Join-Path (Split-Path $project) 'obj\widbar\plugin.json'
-if (-not (Test-Path $pluginManifest)) {
-    throw "WidBar plugin manifest was not generated: $pluginManifest"
-}
-
-$public = Join-Path $layout 'Public'
-$images = Join-Path $layout 'Images'
-New-Item -ItemType Directory -Path $public -Force | Out-Null
-New-Item -ItemType Directory -Path $images -Force | Out-Null
-Copy-Item -LiteralPath $pluginManifest -Destination (Join-Path $public 'plugin.json') -Force
-Copy-Item -Path (Join-Path $packageRoot 'Images\*.png') -Destination $images -Force
-Copy-Item -LiteralPath (Join-Path $root 'THIRD_PARTY_NOTICES.md') `
-    -Destination (Join-Path $layout 'THIRD_PARTY_NOTICES.md') -Force
-$baseImages = @('AppIcon', 'StoreLogo', 'SmallTile', 'MediumTile', 'WideTile', 'LargeTile')
-foreach ($baseImage in $baseImages) {
-    Copy-Item -LiteralPath (Join-Path $images "$baseImage.scale-100.png") `
-        -Destination (Join-Path $images "$baseImage.png") -Force
-}
-$layoutManifest = Join-Path $layout 'AppxManifest.xml'
-Copy-Item -LiteralPath (Join-Path $packageRoot 'Package.local.appxmanifest') `
-    -Destination $layoutManifest -Force
-
-# x-generate is a packaging-project placeholder. Unlike MSBuild packaging,
-# loose Appx registration does not replace it and Windows rejects the manifest.
-[xml]$manifestXml = Get-Content -LiteralPath $layoutManifest -Raw
-$resourceLanguages = @($manifestXml.Package.Resources.Resource | ForEach-Object Language)
-if (-not $resourceLanguages -or $resourceLanguages -contains 'x-generate') {
-    throw 'The local Appx manifest must contain a concrete resource language (for example en-US).'
-}
-
-$required = @(
-    'AppxManifest.xml',
-    'Codex.TaskbarStatus.ExtensionApp.exe',
-    'coreclr.dll',
-    'hostfxr.dll',
-    'hostpolicy.dll',
-    'THIRD_PARTY_NOTICES.md',
-    'Public\plugin.json',
-    'Images\AppIcon.scale-100.png'
-)
-foreach ($relativePath in $required) {
-    if (-not (Test-Path (Join-Path $layout $relativePath))) {
-        throw "Local package layout is incomplete: $relativePath"
+if ($previousLayoutMoved -and (Test-Path $backupLayout)) {
+    try {
+        Remove-Item -LiteralPath $backupLayout -Recurse -Force -ErrorAction Stop
+    } catch {
+        Write-Warning "The old layout could not be removed and was left at: $backupLayout"
     }
 }
 
-Write-Host "Local WidBar package layout: $layout"
+Write-Host "Local WidBar package layout: $targetLayout"

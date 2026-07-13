@@ -171,7 +171,7 @@ public sealed class RolloutStatusReader
         {
             case "task_started":
                 state.Status = CodexExecutionStatuses.Running;
-                state.Activity = "Executando";
+                state.Activity = CodexActivityLabels.Running;
                 state.TurnId = ReadString(payload, "turn_id") ?? state.TurnId;
                 state.StartedAtUtc = timestamp;
                 state.StoppedAtUtc = null;
@@ -184,7 +184,7 @@ public sealed class RolloutStatusReader
 
             case "task_complete":
                 state.Status = CodexExecutionStatuses.Completed;
-                state.Activity = "Concluído";
+                state.Activity = CodexActivityLabels.Completed;
                 state.TurnId = ReadString(payload, "turn_id") ?? state.TurnId;
                 state.StoppedAtUtc = timestamp;
                 state.ActiveSubagents = 0;
@@ -192,7 +192,7 @@ public sealed class RolloutStatusReader
 
             case "turn_aborted":
                 state.Status = CodexExecutionStatuses.Aborted;
-                state.Activity = "Interrompido";
+                state.Activity = CodexActivityLabels.Interrupted;
                 state.TurnId = ReadString(payload, "turn_id") ?? state.TurnId;
                 state.StoppedAtUtc = timestamp;
                 state.ActiveSubagents = 0;
@@ -204,13 +204,13 @@ public sealed class RolloutStatusReader
                 if (ReadBoolean(payload, "success") is false)
                 {
                     state.Status = CodexExecutionStatuses.Error;
-                    state.Activity = "Erro ao aplicar alterações";
+                    state.Activity = CodexActivityLabels.FailedToApplyChanges;
                     state.ErrorMessage = ReadString(payload, "stderr");
                 }
                 else
                 {
                     state.Status = CodexExecutionStatuses.Running;
-                    state.Activity = "Aplicando alterações";
+                    state.Activity = CodexActivityLabels.ApplyingChanges;
                 }
 
                 if (TryGet(payload, "changes", out var changes) && changes.ValueKind == JsonValueKind.Object)
@@ -231,19 +231,19 @@ public sealed class RolloutStatusReader
                 {
                     state.ActiveSubagents++;
                     state.TotalSubagents++;
-                    state.Activity = "Executando subagente";
+                    state.Activity = CodexActivityLabels.RunningSubagent;
                 }
                 else if (kind is "completed" or "stopped" or "failed")
                 {
                     state.ActiveSubagents = Math.Max(0, state.ActiveSubagents - 1);
-                    state.Activity = "Processando resultado do subagente";
+                    state.Activity = CodexActivityLabels.ProcessingSubagentResult;
                 }
                 break;
 
             case "agent_message":
                 if (state.Status == CodexExecutionStatuses.Running)
                 {
-                    state.Activity = "Gerando resposta";
+                    state.Activity = CodexActivityLabels.GeneratingResponse;
                 }
                 break;
 
