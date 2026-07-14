@@ -2,7 +2,7 @@
 param(
     [ValidateSet('Debug', 'Release')]
     [string]$Configuration = 'Release',
-    [string]$Version = '1.1.0',
+    [string]$Version = '1.1.1',
     [string]$OutputDirectory,
     [string]$LayoutPath,
     [string]$ManifestPath,

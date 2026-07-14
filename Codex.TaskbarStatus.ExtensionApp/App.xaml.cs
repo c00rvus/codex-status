@@ -11,6 +11,8 @@ namespace Codex.TaskbarStatus.ExtensionApp;
 // windows. All we do here is hand it our plugin (one instance per active widget).
 public partial class App : WidgetHostApplication
 {
+    private PreviewWindowRecovery? _previewWindowRecovery;
+
     public App()
     {
         InitializeComponent();
@@ -29,6 +31,12 @@ public partial class App : WidgetHostApplication
         Resources.MergedDictionaries.Add(settingsHostResources);
 
         base.OnLaunched(args);
+
+        if (IsWidBarHostLaunch())
+        {
+            _previewWindowRecovery = new PreviewWindowRecovery();
+            _previewWindowRecovery.Start();
+        }
     }
 
     protected override IWidgetPlugin CreatePlugin() => new MainPlugin();

@@ -9,7 +9,7 @@
   <Identity
     Name="Codex.TaskbarStatus.Widget"
     Publisher="CN=Codex Taskbar Status Local"
-    Version="1.1.0.0"
+    Version="1.1.1.0"
     ProcessorArchitecture="x64" />
 
   <Properties>

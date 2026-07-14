@@ -10,7 +10,7 @@ $ErrorActionPreference = 'Stop'
 
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $packageName = 'Codex.TaskbarStatus.Widget'
-$msix = Join-Path $root 'artifacts\Codex.TaskbarStatus_1.1.0.0_x64.msix'
+$msix = Join-Path $root 'artifacts\Codex.TaskbarStatus_1.1.1.0_x64.msix'
 
 function Get-DevelopmentManifestPaths {
     param(

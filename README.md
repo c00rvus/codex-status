@@ -67,7 +67,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Test-ReleaseHe
 Build the release installer with [Inno Setup 6](https://jrsoftware.org/isinfo.php):
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Compile-Installer.ps1 -Version 1.1.0
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Compile-Installer.ps1 -Version 1.1.1
 ```
 
 Pushing a new `vX.Y.Z` tag runs the GitHub Actions workflow and publishes the installer plus `SHA256SUMS.txt` to a new GitHub Release.

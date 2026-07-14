@@ -89,7 +89,7 @@ internal sealed class CodexAppServerClient : IAsyncDisposable
                     {
                         name = "codex-status-widget",
                         title = "Codex Status Widget",
-                        version = "1.1.0",
+                        version = "1.1.1",
                     },
                     capabilities = new { },
                 },
