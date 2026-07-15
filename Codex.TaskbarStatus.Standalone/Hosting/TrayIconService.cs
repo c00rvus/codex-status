@@ -16,13 +16,6 @@ internal sealed class TrayIconService : IDisposable
     private const uint WmApp = 0x8000;
     private const uint WmTimer = 0x0113;
     private const uint WmNull = 0x0000;
-    private const uint WmLButtonUp = 0x0202;
-    private const uint WmLButtonDoubleClick = 0x0203;
-    private const uint WmRButtonUp = 0x0205;
-    private const uint WmContextMenu = 0x007B;
-    private const uint NinSelect = 0x0400;
-    private const uint NinKeySelect = 0x0401;
-
     private const uint NifMessage = 0x00000001;
     private const uint NifIcon = 0x00000002;
     private const uint NifTip = 0x00000004;
@@ -57,6 +50,7 @@ internal sealed class TrayIconService : IDisposable
     private readonly string _windowClassName;
     private readonly nint _module;
     private readonly uint _taskbarCreatedMessage;
+    private readonly TrayIconActivationFilter _activationFilter = new();
 
     private nint _window;
     private nint _icon;
@@ -306,24 +300,20 @@ internal sealed class TrayIconService : IDisposable
 
     private void HandleNotification(uint notification, nint callbackData)
     {
-        switch (notification)
+        if (_activationFilter.ShouldOpenSettings(
+                notification,
+                _usesVersion4,
+                Environment.TickCount64))
         {
-            case WmLButtonUp:
-            case WmLButtonDoubleClick:
-            case NinSelect:
-            case NinKeySelect:
-                _openSettings();
-                break;
+            _openSettings();
+            return;
+        }
 
-            case WmRButtonUp:
-                ShowContextMenu();
-                break;
-
-            case WmContextMenu:
-                ShowContextMenu(_usesVersion4
-                    ? Point.FromPacked(callbackData)
-                    : null);
-                break;
+        if (TrayIconActivationFilter.ShouldShowContextMenu(notification, _usesVersion4))
+        {
+            ShowContextMenu(_usesVersion4
+                ? Point.FromPacked(callbackData)
+                : null);
         }
     }
 

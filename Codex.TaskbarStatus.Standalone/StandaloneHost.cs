@@ -18,6 +18,7 @@ internal sealed class StandaloneHost
     private SettingsWindow? _settingsWindow;
     private TrayIconService? _trayIcon;
     private DispatcherQueue? _dispatcherQueue;
+    private bool _settingsWindowOpening;
     private bool _exiting;
 
     private readonly bool _openFlyoutOnStart;
@@ -175,36 +176,86 @@ internal sealed class StandaloneHost
             return;
         }
 
-        _flyoutWindow?.Hide();
         if (_settingsWindow is not null)
         {
+            _flyoutWindow?.Hide();
             _settingsWindow.BringToFront();
             return;
         }
 
-        var originalSettings = _context?.SettingsJson ?? _settings.WidgetSettingsJson;
-        var originalStandaloneSettings = CloneSettings(_settings);
-        var placementDraft = ToPlacementDraft(_settings);
-        _settingsWindow = new SettingsWindow(
-            _widget,
-            originalSettings,
-            placementDraft,
-            GetMonitorOptions(),
-            draftJson =>
+        if (_settingsWindowOpening)
+        {
+            return;
+        }
+
+        _settingsWindowOpening = true;
+        SettingsWindow? createdWindow = null;
+        try
+        {
+            _flyoutWindow?.Hide();
+            var originalSettings = _context?.SettingsJson ?? _settings.WidgetSettingsJson;
+            var originalStandaloneSettings = CloneSettings(_settings);
+            var placementDraft = ToPlacementDraft(_settings);
+            createdWindow = new SettingsWindow(
+                _widget,
+                originalSettings,
+                placementDraft,
+                GetMonitorOptions(),
+                draftJson =>
+                {
+                    _widget.OnSettingsDraftChanged(draftJson);
+                    RefreshPreview();
+                },
+                ApplyPlacementDraft,
+                SaveSettings,
+                () =>
+                {
+                    if (!ReferenceEquals(_settingsWindow, createdWindow))
+                    {
+                        return;
+                    }
+
+                    _settings = originalStandaloneSettings;
+                    _widget.OnSettingsDraftChanged(originalSettings);
+                    RefreshPreview();
+                },
+                () =>
+                {
+                    if (ReferenceEquals(_settingsWindow, createdWindow))
+                    {
+                        _settingsWindow = null;
+                    }
+                });
+            _settingsWindow = createdWindow;
+            createdWindow.ShowCentered();
+        }
+        catch
+        {
+            if (createdWindow is not null)
             {
-                _widget.OnSettingsDraftChanged(draftJson);
-                RefreshPreview();
-            },
-            ApplyPlacementDraft,
-            SaveSettings,
-            () =>
+                try
+                {
+                    createdWindow.Close();
+                }
+                catch (Exception closeException)
+                {
+                    StandaloneLog.Write(
+                        "Closing the settings window after an activation failure failed",
+                        closeException);
+                }
+            }
+
+            if (ReferenceEquals(_settingsWindow, createdWindow))
             {
-                _settings = originalStandaloneSettings;
-                _widget.OnSettingsDraftChanged(originalSettings);
-                RefreshPreview();
-            },
-            () => _settingsWindow = null);
-        _settingsWindow.ShowCentered();
+                _settingsWindow = null;
+            }
+
+            throw;
+        }
+        finally
+        {
+            _settingsWindowOpening = false;
+        }
     }
 
     private void SaveSettings(

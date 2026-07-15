@@ -23,4 +23,9 @@
     <ProjectReference Include="..\Codex.TaskbarStatus.Core\Codex.TaskbarStatus.Core.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Compile Include="..\Codex.TaskbarStatus.Standalone\Hosting\TrayIconActivationFilter.cs"
+             Link="Hosting\TrayIconActivationFilter.cs" />
+  </ItemGroup>
+
 </Project>

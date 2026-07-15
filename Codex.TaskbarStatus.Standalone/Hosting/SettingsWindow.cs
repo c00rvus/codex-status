@@ -202,11 +202,21 @@ internal sealed class SettingsWindow
         appTitleBar.ButtonInactiveForegroundColor = ColorHelper.FromArgb(255, 160, 160, 160);
         _window.Closed += (_, _) =>
         {
-            if (!_saved)
+            try
             {
-                _onCancelled();
+                if (!_saved)
+                {
+                    _onCancelled();
+                }
             }
-            _onClosed();
+            catch (Exception exception)
+            {
+                StandaloneLog.Write("Restoring settings after cancellation failed", exception);
+            }
+            finally
+            {
+                _onClosed();
+            }
         };
     }
 
@@ -228,6 +238,8 @@ internal sealed class SettingsWindow
         _window.Activate();
         NativeMethods.SetForegroundWindow(NativeMethods.GetHandle(_window));
     }
+
+    internal void Close() => _window.Close();
 
     private static Grid CreateSettingsTabs(
         UIElement widgetSettings,
