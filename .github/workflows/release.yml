@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version without the v prefix (for example, 1.2.0)"
+        description: "Release version without the v prefix (for example, 2.0.0)"
         required: true
         type: string
 
@@ -20,7 +20,7 @@ concurrency:
 
 jobs:
   build:
-    name: Build Windows installer
+    name: Build standalone Windows installer
     runs-on: windows-2025
     permissions:
       contents: read
@@ -92,7 +92,9 @@ jobs:
               (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe'),
               (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe')
             )
-            return $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+            return $candidates |
+              Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+              Select-Object -First 1
           }
 
           $compiler = Find-InnoCompiler
@@ -127,13 +129,12 @@ jobs:
 
           Write-Host "Using Inno Setup compiler: $compiler"
 
-      - name: Compile signed installer
+      - name: Compile standalone installer
         shell: pwsh
         run: >-
           powershell.exe -NoProfile -ExecutionPolicy Bypass
           -File .\scripts\Compile-Installer.ps1
           -Version "${{ steps.version.outputs.version }}"
-          -TimestampUrl "http://timestamp.digicert.com"
 
       - name: Validate release files
         shell: pwsh
@@ -142,14 +143,16 @@ jobs:
           $releaseDirectory = Resolve-Path '.\artifacts\release'
           $installer = Join-Path $releaseDirectory "CodexStatusSetup-$version-x64.exe"
           $checksums = Join-Path $releaseDirectory 'SHA256SUMS.txt'
-          foreach ($path in @($installer, $checksums)) {
+          $expectedFiles = @($installer, $checksums)
+
+          foreach ($path in $expectedFiles) {
             if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
               throw "Expected release file was not generated: $path"
             }
           }
 
           $unexpected = @(Get-ChildItem -LiteralPath $releaseDirectory -File |
-            Where-Object { $_.FullName -notin @($installer, $checksums) })
+            Where-Object { $_.FullName -notin $expectedFiles })
           if ($unexpected.Count -gt 0) {
             throw "Unexpected release files were generated: $($unexpected.Name -join ', ')"
           }
@@ -161,7 +164,7 @@ jobs:
             throw 'SHA256SUMS.txt does not match the generated installer.'
           }
 
-          Get-AuthenticodeSignature -FilePath $installer | Format-List Status, StatusMessage, SignerCertificate
+          Get-Item -LiteralPath $installer | Format-List Name, Length, LastWriteTimeUtc
           Get-Content -LiteralPath $checksums
 
       - name: Upload workflow artifact
@@ -219,9 +222,7 @@ jobs:
           $releaseNotes = @"
           ## Install
 
-          Download **CodexStatusSetup-$env:RELEASE_VERSION-x64.exe** below and double-click it. No terminal commands, .NET SDK, Windows App Runtime installation, or Developer Mode are required.
-
-          The current installer uses a self-signed certificate, so Windows can show **Unknown publisher**. Confirm that the file came from this repository before choosing **More info > Run anyway**.
+          Download **CodexStatusSetup-$env:RELEASE_VERSION-x64.exe** and run it. The installer includes the required runtime, configures Codex lifecycle hooks, and enables startup with Windows.
           "@
 
           $arguments = @(

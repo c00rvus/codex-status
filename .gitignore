@@ -1,4 +1,6 @@
 .vs/
+.agents/
+.codex/
 **/bin/
 **/obj/
 artifacts/
