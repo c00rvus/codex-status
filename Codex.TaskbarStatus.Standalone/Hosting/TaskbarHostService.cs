@@ -5,6 +5,12 @@ namespace Codex.TaskbarStatus.Standalone.Hosting;
 
 internal sealed class TaskbarHostService
 {
+    private static readonly TimeSpan FastWatchdogInterval =
+        TimeSpan.FromMilliseconds(750);
+    private static readonly TimeSpan StableWatchdogInterval =
+        TimeSpan.FromMilliseconds(2500);
+    private const int StableRefreshesBeforeBackoff = 4;
+
     private readonly TaskbarPreviewWindow _preview;
     private readonly Func<int> _previewLogicalWidth;
     private readonly Func<bool> _previewVisible;
@@ -18,6 +24,7 @@ internal sealed class TaskbarHostService
     private nint _lastSuccessfulTaskbar;
     private bool _lastAttached;
     private bool _restartSignalled;
+    private int _stableRefreshes;
 
     internal TaskbarHostService(
         TaskbarPreviewWindow preview,
@@ -31,8 +38,8 @@ internal sealed class TaskbarHostService
         _previewVisible = previewVisible;
         _settings = settings;
         _restartRequested = restartRequested;
-        _watchdog = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(750) };
-        _watchdog.Tick += (_, _) => Refresh();
+        _watchdog = new DispatcherTimer { Interval = FastWatchdogInterval };
+        _watchdog.Tick += (_, _) => RefreshCore();
     }
 
     internal PixelRectangle CurrentSlot => _lastSlot;
@@ -50,6 +57,12 @@ internal sealed class TaskbarHostService
 
     internal void Refresh()
     {
+        ResetWatchdogCadence();
+        RefreshCore();
+    }
+
+    private void RefreshCore()
+    {
         try
         {
             if (!NativeMethods.IsWindow(_preview.WindowHandle))
@@ -57,6 +70,7 @@ internal sealed class TaskbarHostService
                 if (!_restartSignalled)
                 {
                     _restartSignalled = true;
+                    _watchdog.Stop();
                     StandaloneLog.Write(
                         "The taskbar destroyed the preview HWND; requesting a controlled relaunch.");
                     _restartRequested();
@@ -77,11 +91,19 @@ internal sealed class TaskbarHostService
                 !NativeMethods.GetWindowRect(taskbar, out var taskbarBounds) ||
                 taskbarBounds.IsEmpty ||
                 taskbarBounds.Height < 16 ||
-                taskbarBounds.Height > 200 ||
-                !_previewVisible())
+                taskbarBounds.Height > 200)
             {
                 _preview.Hide();
                 RecordAttachment(taskbar, default, attached: false);
+                ResetWatchdogCadence();
+                return;
+            }
+
+            if (!_previewVisible())
+            {
+                _preview.Hide();
+                var changed = RecordAttachment(taskbar, default, attached: false);
+                UpdateWatchdogCadence(stable: !changed);
                 return;
             }
 
@@ -129,6 +151,7 @@ internal sealed class TaskbarHostService
                     _preview.Hide();
                     RecordAttachment(taskbar, default, attached: false);
                 }
+                ResetWatchdogCadence();
                 return;
             }
 
@@ -148,7 +171,8 @@ internal sealed class TaskbarHostService
             if (slot is null)
             {
                 _preview.Hide();
-                RecordAttachment(taskbar, default, attached: false);
+                var changed = RecordAttachment(taskbar, default, attached: false);
+                UpdateWatchdogCadence(stable: !changed);
                 return;
             }
 
@@ -158,20 +182,22 @@ internal sealed class TaskbarHostService
                 slot.Value.X + slot.Value.Width,
                 slot.Value.Y + slot.Value.Height);
             var attached = _preview.AttachAndShow(taskbar, taskbarBounds, slotBounds);
-            RecordAttachment(taskbar, slot.Value, attached);
+            var attachmentChanged = RecordAttachment(taskbar, slot.Value, attached);
+            UpdateWatchdogCadence(stable: attached && !attachmentChanged);
         }
         catch (Exception exception)
         {
             _preview.Hide();
+            ResetWatchdogCadence();
             StandaloneLog.Write("Taskbar watchdog failed", exception);
         }
     }
 
-    private void RecordAttachment(nint taskbar, PixelRectangle slot, bool attached)
+    private bool RecordAttachment(nint taskbar, PixelRectangle slot, bool attached)
     {
         if (_lastTaskbar == taskbar && _lastSlot == slot && _lastAttached == attached)
         {
-            return;
+            return false;
         }
 
         var isMeasurementJitter =
@@ -192,11 +218,37 @@ internal sealed class TaskbarHostService
         }
         if (isMeasurementJitter)
         {
-            return;
+            return true;
         }
 
         StandaloneLog.Write(
             $"Taskbar state: attached={attached}, taskbar=0x{taskbar:X}, " +
             $"preview=0x{_preview.WindowHandle:X}, slot={slot.X},{slot.Y} {slot.Width}x{slot.Height}");
+        return true;
+    }
+
+    private void UpdateWatchdogCadence(bool stable)
+    {
+        if (!stable)
+        {
+            ResetWatchdogCadence();
+            return;
+        }
+
+        _stableRefreshes++;
+        if (_stableRefreshes >= StableRefreshesBeforeBackoff &&
+            _watchdog.Interval != StableWatchdogInterval)
+        {
+            _watchdog.Interval = StableWatchdogInterval;
+        }
+    }
+
+    private void ResetWatchdogCadence()
+    {
+        _stableRefreshes = 0;
+        if (_watchdog.Interval != FastWatchdogInterval)
+        {
+            _watchdog.Interval = FastWatchdogInterval;
+        }
     }
 }

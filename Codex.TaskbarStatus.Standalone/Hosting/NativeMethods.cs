@@ -56,6 +56,7 @@ internal static class NativeMethods
     internal const uint SwpNoActivate = 0x0010;
     internal const uint SwpFrameChanged = 0x0020;
     internal const uint SwpShowWindow = 0x0040;
+    internal const uint GwHwndPrev = 3;
 
     internal const uint LwaColorKey = 0x00000001;
     internal const uint DwmwaBorderColor = 34;
@@ -263,6 +264,9 @@ internal static class NativeMethods
 
     [DllImport("user32.dll", SetLastError = true)]
     internal static extern nint GetParent(nint child);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    internal static extern nint GetWindow(nint window, uint command);
 
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]

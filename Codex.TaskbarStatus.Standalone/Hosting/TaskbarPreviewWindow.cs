@@ -13,6 +13,7 @@ internal sealed class TaskbarPreviewWindow
     private readonly Border _hoverSurface;
     private readonly nint _windowHandle;
     private bool _bridgeIsTransparent;
+    private bool _childStyleApplied;
 
     internal TaskbarPreviewWindow(
         UIElement content,
@@ -123,8 +124,20 @@ internal sealed class TaskbarPreviewWindow
             return false;
         }
 
-        ApplyChildStyle();
-        if (NativeMethods.GetParent(_windowHandle) != taskbar)
+        var currentParent = NativeMethods.GetParent(_windowHandle);
+        var parentChanged = currentParent != taskbar;
+        var styleChanged = false;
+        if (parentChanged)
+        {
+            // SetParent does not update WS_CHILD/WS_POPUP. Revalidate the
+            // cached style only when the native parent actually changes.
+            _childStyleApplied = false;
+        }
+        if (!_childStyleApplied)
+        {
+            styleChanged = ApplyChildStyle();
+        }
+        if (parentChanged)
         {
             NativeMethods.SetParent(_windowHandle, taskbar);
         }
@@ -137,34 +150,77 @@ internal sealed class TaskbarPreviewWindow
             return false;
         }
 
+        var hasCurrentBounds = NativeMethods.GetWindowRect(
+            _windowHandle,
+            out var currentBounds);
+        var boundsAreCurrent = hasCurrentBounds && currentBounds == slotBounds;
+        var isVisible = NativeMethods.IsWindowVisible(_windowHandle);
+        var isTopSibling = NativeMethods.GetWindow(
+            _windowHandle,
+            NativeMethods.GwHwndPrev) == nint.Zero;
+
+        if (boundsAreCurrent && isVisible && isTopSibling && !styleChanged && !parentChanged)
+        {
+            // The watchdog normally reaches this path. Avoid invalidating the
+            // WinUI composition tree when Explorer has not changed anything.
+            ApplyBridgeTransparency();
+            return true;
+        }
+
         var relativeX = slotBounds.Left - taskbarBounds.Left;
         var relativeY = slotBounds.Top - taskbarBounds.Top;
-        var positioned = NativeMethods.SetWindowPos(
-            _windowHandle,
-            NativeMethods.HwndTop,
-            relativeX,
-            relativeY,
-            slotBounds.Width,
-            slotBounds.Height,
-            NativeMethods.SwpNoActivate |
-            NativeMethods.SwpFrameChanged |
-            NativeMethods.SwpShowWindow);
-        if (!positioned)
+        if (!boundsAreCurrent || !isTopSibling || styleChanged || parentChanged)
         {
-            Hide();
-            StandaloneLog.Write(
-                $"Taskbar positioning failed: preview=0x{_windowHandle:X}, taskbar=0x{taskbar:X}");
-            return false;
+            var flags = NativeMethods.SwpNoActivate;
+            if (boundsAreCurrent)
+            {
+                flags |= NativeMethods.SwpNoMove | NativeMethods.SwpNoSize;
+            }
+            if (styleChanged || parentChanged)
+            {
+                flags |= NativeMethods.SwpFrameChanged;
+            }
+            if (!isVisible)
+            {
+                flags |= NativeMethods.SwpShowWindow;
+            }
+
+            var positioned = NativeMethods.SetWindowPos(
+                _windowHandle,
+                NativeMethods.HwndTop,
+                relativeX,
+                relativeY,
+                slotBounds.Width,
+                slotBounds.Height,
+                flags);
+            if (!positioned)
+            {
+                Hide();
+                StandaloneLog.Write(
+                    $"Taskbar positioning failed: preview=0x{_windowHandle:X}, taskbar=0x{taskbar:X}");
+                return false;
+            }
+
+            isVisible = isVisible ||
+                        (flags & NativeMethods.SwpShowWindow) != 0;
         }
 
         ApplyBridgeTransparency();
-        NativeMethods.ShowWindow(_windowHandle, NativeMethods.SwShowNoActivate);
-        return true;
+        if (!isVisible)
+        {
+            NativeMethods.ShowWindow(_windowHandle, NativeMethods.SwShowNoActivate);
+        }
+
+        return NativeMethods.IsWindowVisible(_windowHandle);
     }
 
     internal void Hide()
     {
-        NativeMethods.ShowWindow(_windowHandle, NativeMethods.SwHide);
+        if (NativeMethods.IsWindow(_windowHandle) &&
+            NativeMethods.IsWindowVisible(_windowHandle))
+        {
+            NativeMethods.ShowWindow(_windowHandle, NativeMethods.SwHide);
+        }
     }
 
     private void ApplyTransparentChrome()
@@ -184,18 +240,25 @@ internal sealed class TaskbarPreviewWindow
         ApplyChildStyle();
     }
 
-    private void ApplyChildStyle()
+    private bool ApplyChildStyle()
     {
+        if (_childStyleApplied)
+        {
+            return false;
+        }
+
         const int previewStyle =
             NativeMethods.WsChild |
             NativeMethods.WsVisible |
             NativeMethods.WsClipSiblings;
+        var changed = false;
         if (NativeMethods.GetWindowLong(_windowHandle, NativeMethods.GwlStyle) != previewStyle)
         {
             NativeMethods.SetWindowLong(
                 _windowHandle,
                 NativeMethods.GwlStyle,
                 previewStyle);
+            changed = true;
         }
 
         if (NativeMethods.GetWindowLong(_windowHandle, NativeMethods.GwlExStyle) !=
@@ -205,7 +268,14 @@ internal sealed class TaskbarPreviewWindow
                 _windowHandle,
                 NativeMethods.GwlExStyle,
                 NativeMethods.WsExNoActivate);
+            changed = true;
         }
+
+        _childStyleApplied =
+            NativeMethods.GetWindowLong(_windowHandle, NativeMethods.GwlStyle) == previewStyle &&
+            NativeMethods.GetWindowLong(_windowHandle, NativeMethods.GwlExStyle) ==
+            NativeMethods.WsExNoActivate;
+        return changed;
     }
 
     private void ApplyBridgeTransparency()

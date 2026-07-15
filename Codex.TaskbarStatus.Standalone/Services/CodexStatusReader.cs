@@ -30,7 +30,7 @@ internal sealed class CodexStatusSnapshot
     }
 }
 
-internal sealed class CodexStatusReader
+internal sealed class CodexStatusReader : IDisposable
 {
     private readonly StatusFileStore _statusStore = new();
     private readonly RolloutStatusReader _rolloutReader = new();
@@ -51,6 +51,8 @@ internal sealed class CodexStatusReader
         var state = SelectState(hookState, _cachedRollout, out var source);
         return state is null ? new CodexStatusSnapshot() : Map(state, source);
     }
+
+    public void Dispose() => _rolloutReader.Dispose();
 
     private static CodexExecutionState? SelectState(
         CodexExecutionState? hookState,

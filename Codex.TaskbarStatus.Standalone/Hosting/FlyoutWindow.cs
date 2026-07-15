@@ -15,6 +15,7 @@ internal sealed class FlyoutWindow : IDisposable
     private readonly int _logicalWidth;
     private readonly int _logicalHeight;
     private readonly OutsideClickMonitor _outsideClickMonitor;
+    private readonly Action<bool> _visibilityChanged;
     private NativeMethods.Rect _previewBounds;
 
     internal FlyoutWindow(
@@ -22,11 +23,13 @@ internal sealed class FlyoutWindow : IDisposable
         int logicalWidth,
         int logicalHeight,
         nint previewWindowHandle,
-        Action openSettings)
+        Action openSettings,
+        Action<bool> visibilityChanged)
     {
         _logicalWidth = logicalWidth;
         _logicalHeight = logicalHeight;
         _previewWindowHandle = previewWindowHandle;
+        _visibilityChanged = visibilityChanged;
 
         var card = new Border
         {
@@ -130,6 +133,7 @@ internal sealed class FlyoutWindow : IDisposable
         var appWindow = NativeMethods.GetAppWindow(_window);
         appWindow.Resize(new SizeInt32(width, height));
         appWindow.Move(new PointInt32(x, y));
+        _visibilityChanged(true);
         _window.Activate();
         NativeMethods.SetForegroundWindow(_windowHandle);
         try
@@ -147,8 +151,13 @@ internal sealed class FlyoutWindow : IDisposable
 
     internal void Hide()
     {
+        var wasVisible = IsVisible;
         _outsideClickMonitor.Stop();
         NativeMethods.ShowWindow(_windowHandle, NativeMethods.SwHide);
+        if (wasVisible)
+        {
+            _visibilityChanged(false);
+        }
     }
 
     public void Dispose()

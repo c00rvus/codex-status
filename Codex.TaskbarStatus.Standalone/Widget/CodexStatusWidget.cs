@@ -33,6 +33,10 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
     private DispatcherTimer? _spinnerTimer;
     private TextBlock? _spinnerText;
     private bool _spinnerTimerRunning;
+    private bool _flyoutVisible;
+    private int _settingsVersion;
+    private PreviewVisualState? _lastPreviewVisualState;
+    private FlyoutVisualState? _lastFlyoutVisualState;
     private int _previewLogicalWidth = 400;
     private IWidgetRuntimeContext? _context;
 
@@ -54,6 +58,7 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
     internal UIElement CreatePreviewContent()
     {
         var initialWidth = _previewLogicalWidth;
+        _lastPreviewVisualState = null;
         _previewRoot = new Border
         {
             Background = new SolidColorBrush(Colors.Transparent),
@@ -63,7 +68,7 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
         };
 
         AutomationProperties.SetName(_previewRoot, "Codex execution status");
-        RenderPreview();
+        RenderPreview(force: true, DateTimeOffset.UtcNow);
         EnsureTimers();
 
         if (initialWidth != _previewLogicalWidth)
@@ -76,13 +81,13 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
 
     internal UIElement CreateFlyoutContent()
     {
+        _lastFlyoutVisualState = null;
         _flyoutRoot = new StackPanel
         {
             Spacing = 14,
             Padding = new Thickness(22),
         };
 
-        RenderFlyout();
         EnsureTimers();
 
         return new ScrollViewer
@@ -172,9 +177,23 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
     internal void OnSettingsDraftChanged(string settingsJson)
     {
         _settings = CodexWidgetSettings.FromJson(settingsJson);
-        RenderPreview();
+        _settingsVersion++;
+        RenderPreview(force: true, DateTimeOffset.UtcNow);
         SyncSpinnerTimer();
         _context?.RequestPreviewRefresh();
+    }
+
+    internal void OnFlyoutVisibilityChanged(bool isVisible)
+    {
+        _flyoutVisible = isVisible;
+        if (!isVisible)
+        {
+            return;
+        }
+
+        // Refresh synchronously before the popup becomes visible so its first
+        // painted frame never shows data left over from the previous opening.
+        RefreshVisualState(forceFlyout: true);
     }
 
     public async ValueTask DisposeAsync()
@@ -184,9 +203,13 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
         _spinnerTimer?.Stop();
         _spinnerTimer = null;
         _spinnerTimerRunning = false;
+        _flyoutVisible = false;
         _spinnerText = null;
         _previewRoot = null;
         _flyoutRoot = null;
+        _lastPreviewVisualState = null;
+        _lastFlyoutVisualState = null;
+        _statusReader.Dispose();
         await _rateLimitService.DisposeAsync();
     }
 
@@ -194,23 +217,8 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
     {
         if (_refreshTimer is null)
         {
-            _refreshTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(750) };
-            _refreshTimer.Tick += (_, _) =>
-            {
-                var priorVisibility = IsPreviewVisible;
-                var priorWidth = PreviewLogicalWidth;
-                _snapshot = _statusReader.Read();
-                _rateLimitService.RequestRefresh();
-                _rateLimits = _rateLimitService.Current;
-                RenderPreview();
-                SyncSpinnerTimer();
-                RenderFlyout();
-
-                if (priorVisibility != IsPreviewVisible || priorWidth != PreviewLogicalWidth)
-                {
-                    _context?.RequestPreviewRefresh();
-                }
-            };
+            _refreshTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+            _refreshTimer.Tick += (_, _) => RefreshVisualState();
             _refreshTimer.Start();
         }
 
@@ -223,11 +231,40 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
         SyncSpinnerTimer();
     }
 
-    private void RenderPreview()
+    private void RefreshVisualState(bool forceFlyout = false)
+    {
+        var priorVisibility = IsPreviewVisible;
+        var priorWidth = PreviewLogicalWidth;
+        var now = DateTimeOffset.UtcNow;
+
+        _snapshot = _statusReader.Read();
+        _rateLimitService.RequestRefresh();
+        _rateLimits = _rateLimitService.Current;
+
+        RenderPreview(force: false, now);
+        SyncSpinnerTimer();
+        if (_flyoutVisible)
+        {
+            RenderFlyout(forceFlyout, now);
+        }
+
+        if (priorVisibility != IsPreviewVisible || priorWidth != PreviewLogicalWidth)
+        {
+            _context?.RequestPreviewRefresh();
+        }
+    }
+
+    private bool RenderPreview(bool force, DateTimeOffset now)
     {
         if (_previewRoot is null)
         {
-            return;
+            return false;
+        }
+
+        var visualState = CreatePreviewVisualState(now);
+        if (!force && _lastPreviewVisualState is { } previous && previous == visualState)
+        {
+            return false;
         }
 
         _spinnerText = null;
@@ -276,7 +313,7 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
                         presentation.SubagentsMaxWidth,
                         presentation.TextFontSize),
                     PreviewIndicatorKind.Elapsed => CreateText(
-                        FormatElapsed(_snapshot.Elapsed(DateTimeOffset.UtcNow)),
+                        visualState.ElapsedText ?? string.Empty,
                         presentation.ElapsedMaxWidth,
                         presentation.TextFontSize),
                     _ => null,
@@ -306,13 +343,21 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
             (int)Math.Ceiling(row.DesiredSize.Width + horizontalChrome),
             96,
             700);
+        _lastPreviewVisualState = visualState;
+        return true;
     }
 
-    private void RenderFlyout()
+    private bool RenderFlyout(bool force, DateTimeOffset now)
     {
         if (_flyoutRoot is null)
         {
-            return;
+            return false;
+        }
+
+        var visualState = CreateFlyoutVisualState(now);
+        if (!force && _lastFlyoutVisualState is { } previous && previous == visualState)
+        {
+            return false;
         }
 
         _flyoutRoot.Children.Clear();
@@ -328,7 +373,7 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
 
         _flyoutRoot.Children.Add(new TextBlock
         {
-            Text = _snapshot.Activity,
+            Text = visualState.Activity,
             FontSize = 15,
             TextWrapping = TextWrapping.Wrap,
             Foreground = Brush("#FFD9DEE4"),
@@ -343,19 +388,80 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
         metrics.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         metrics.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         metrics.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        metrics.Children.Add(CreateMetric("Elapsed", FormatElapsed(_snapshot.Elapsed(DateTimeOffset.UtcNow)), 0, 0));
-        metrics.Children.Add(CreateMetric("Files", _snapshot.FilesChangedCount.ToString(), 0, 1));
-        metrics.Children.Add(CreateMetric("Subagents", _snapshot.TotalSubagents.ToString(), 0, 2));
+        metrics.Children.Add(CreateMetric("Elapsed", visualState.ElapsedText, 0, 0));
+        metrics.Children.Add(CreateMetric("Files", visualState.FilesChangedCount.ToString(), 0, 1));
+        metrics.Children.Add(CreateMetric("Subagents", visualState.TotalSubagents.ToString(), 0, 2));
         _flyoutRoot.Children.Add(metrics);
 
-        AddDetail(_flyoutRoot, "Project", ProjectName(_snapshot.Cwd));
-        AddDetail(_flyoutRoot, "Model", _snapshot.Model);
-        AddDetail(_flyoutRoot, "Updated", FormatUpdatedAt(_snapshot.LastUpdatedAtUtc));
-        AddDetail(_flyoutRoot, "Source", _snapshot.Source);
-        AddDetail(_flyoutRoot, "5-hour limit", FormatRateLimitDetail(_rateLimits.FiveHour));
-        AddDetail(_flyoutRoot, "Weekly limit", FormatRateLimitDetail(_rateLimits.Weekly));
-        AddDetail(_flyoutRoot, "Usage source", _rateLimitService.Source);
+        AddDetail(_flyoutRoot, "Project", visualState.Project);
+        AddDetail(_flyoutRoot, "Model", visualState.Model);
+        AddDetail(_flyoutRoot, "Updated", visualState.UpdatedText);
+        AddDetail(_flyoutRoot, "Source", visualState.Source);
+        AddDetail(_flyoutRoot, "5-hour limit", FormatRateLimitDetail(visualState.FiveHour));
+        AddDetail(_flyoutRoot, "Weekly limit", FormatRateLimitDetail(visualState.Weekly));
+        AddDetail(_flyoutRoot, "Usage source", visualState.RateLimitSource);
+        _lastFlyoutVisualState = visualState;
+        return true;
     }
+
+    private PreviewVisualState CreatePreviewVisualState(DateTimeOffset now)
+    {
+        var isActive = IsActive(_snapshot.Status);
+        var showSpinner = isActive && _settings.ShowPulse;
+        return new PreviewVisualState(
+            _settingsVersion,
+            showSpinner,
+            _settings.ShowActivity && _snapshot.Status == "running",
+            _settings.ShowActivity ? _snapshot.Activity : null,
+            showSpinner ? _snapshot.SessionId : null,
+            showSpinner ? _snapshot.TurnId : null,
+            showSpinner ? _snapshot.StartedAtUtc : null,
+            _settings.ShowFiles ? _snapshot.FilesChangedCount : null,
+            _settings.ShowAgents ? _snapshot.TotalSubagents : null,
+            _settings.ShowElapsed ? FormatElapsed(_snapshot.Elapsed(now)) : null,
+            _settings.ShowFiveHourUsage ? _rateLimits.FiveHour : null,
+            _settings.ShowWeeklyUsage ? _rateLimits.Weekly : null);
+    }
+
+    private FlyoutVisualState CreateFlyoutVisualState(DateTimeOffset now) => new(
+        _snapshot.Activity,
+        FormatElapsed(_snapshot.Elapsed(now)),
+        _snapshot.FilesChangedCount,
+        _snapshot.TotalSubagents,
+        ProjectName(_snapshot.Cwd),
+        _snapshot.Model,
+        FormatUpdatedAt(_snapshot.LastUpdatedAtUtc),
+        _snapshot.Source,
+        _rateLimits.FiveHour,
+        _rateLimits.Weekly,
+        _rateLimitService.Source);
+
+    private readonly record struct PreviewVisualState(
+        int SettingsVersion,
+        bool ShowSpinner,
+        bool ActivityUsesRunningColor,
+        string? Activity,
+        string? SessionId,
+        string? TurnId,
+        DateTimeOffset? SpinnerStartedAtUtc,
+        int? FilesChangedCount,
+        int? TotalSubagents,
+        string? ElapsedText,
+        RateLimitWindowState? FiveHour,
+        RateLimitWindowState? Weekly);
+
+    private readonly record struct FlyoutVisualState(
+        string Activity,
+        string ElapsedText,
+        int FilesChangedCount,
+        int TotalSubagents,
+        string Project,
+        string? Model,
+        string UpdatedText,
+        string Source,
+        RateLimitWindowState FiveHour,
+        RateLimitWindowState Weekly,
+        string RateLimitSource);
 
     private static TextBlock CreateText(
         string text,

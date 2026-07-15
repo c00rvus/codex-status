@@ -163,7 +163,8 @@ internal sealed class StandaloneHost
             _widget.FlyoutWidth,
             _widget.FlyoutHeight,
             previewWindow.WindowHandle,
-            OpenSettings);
+            OpenSettings,
+            _widget.OnFlyoutVisibilityChanged);
         return true;
     }
 
