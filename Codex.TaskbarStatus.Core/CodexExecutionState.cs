@@ -22,6 +22,8 @@ public sealed record CodexExecutionState
 
     public string? TurnId { get; set; }
 
+    public string? TaskTitle { get; set; }
+
     public string? TranscriptPath { get; set; }
 
     public string? Cwd { get; set; }

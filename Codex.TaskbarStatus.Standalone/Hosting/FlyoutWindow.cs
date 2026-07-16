@@ -33,10 +33,10 @@ internal sealed class FlyoutWindow : IDisposable
 
         var card = new Border
         {
-            Background = new SolidColorBrush(Windows.UI.Color.FromArgb(244, 29, 32, 36)),
-            BorderBrush = new SolidColorBrush(Windows.UI.Color.FromArgb(90, 74, 81, 90)),
+            Background = new SolidColorBrush(Windows.UI.Color.FromArgb(218, 24, 27, 31)),
+            BorderBrush = new SolidColorBrush(Windows.UI.Color.FromArgb(72, 255, 255, 255)),
             BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(8),
+            CornerRadius = new CornerRadius(12),
             Child = pluginContent,
         };
         var root = new Grid
@@ -55,6 +55,7 @@ internal sealed class FlyoutWindow : IDisposable
             Margin = new Thickness(0, 12, 12, 0),
             HorizontalAlignment = HorizontalAlignment.Right,
             VerticalAlignment = VerticalAlignment.Top,
+            IsTabStop = false,
             Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent),
             BorderThickness = new Thickness(0),
         };
@@ -146,7 +147,7 @@ internal sealed class FlyoutWindow : IDisposable
             // policy or another process prevents installing the mouse hook.
             StandaloneLog.Write("Outside-click monitor startup failed", exception);
         }
-        StandaloneLog.Write("Details flyout shown.");
+        StandaloneLog.Write($"Details flyout shown at {x},{y} {width}x{height}.");
     }
 
     internal void Hide()

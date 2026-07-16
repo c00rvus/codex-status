@@ -4,10 +4,8 @@ namespace Codex.TaskbarStatus.Tests;
 
 public sealed class PreviewPresentationTests
 {
-    [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public void EnabledMetrics_RemainVisibleAtZero_InEveryLayout(bool compact)
+    [Fact]
+    public void EnabledMetrics_RemainVisibleAtZero_InRegularLayout()
     {
         var presentation = PreviewPresentationFactory.Create(
             showActivity: true,
@@ -16,7 +14,7 @@ public sealed class PreviewPresentationTests
             showElapsed: true,
             showSpinner: true,
             isActive: false,
-            compact: compact,
+            compact: false,
             filesChangedCount: 0,
             totalSubagents: 0);
 
@@ -87,42 +85,84 @@ public sealed class PreviewPresentationTests
     }
 
     [Fact]
-    public void CompactLayout_IsTighterWhileKeepingIdleMetricsVisible()
+    public void CompactLayout_ShowsOnlyActivityAndEnabledUsageLimits()
     {
         var regular = PreviewPresentationFactory.Create(
-            showActivity: true,
-            showFiles: true,
-            showSubagents: true,
-            showElapsed: true,
-            showSpinner: true,
+            new CodexWidgetSettings { Compact = false },
             isActive: false,
-            compact: false,
             filesChangedCount: 0,
             totalSubagents: 0);
         var compact = PreviewPresentationFactory.Create(
-            showActivity: true,
-            showFiles: true,
-            showSubagents: true,
-            showElapsed: true,
-            showSpinner: true,
+            new CodexWidgetSettings { Compact = true },
             isActive: false,
-            compact: true,
             filesChangedCount: 0,
             totalSubagents: 0);
 
         Assert.True(compact.HorizontalPadding < regular.HorizontalPadding);
         Assert.True(compact.RowSpacing < regular.RowSpacing);
+        Assert.Equal(6, compact.RowSpacing);
         Assert.True(compact.LeadingSpacing < regular.LeadingSpacing);
         Assert.True(compact.TextFontSize < regular.TextFontSize);
-        Assert.Equal(regular.LeadingItems, compact.LeadingItems);
-        Assert.Equal(regular.FilesText, compact.FilesText);
-        Assert.Equal(regular.SubagentsText, compact.SubagentsText);
-        Assert.Equal(regular.ShowElapsed, compact.ShowElapsed);
+        Assert.Equal(
+            [
+                PreviewIndicatorKind.Activity,
+                PreviewIndicatorKind.FiveHourUsage,
+                PreviewIndicatorKind.WeeklyUsage,
+            ],
+            compact.Items.Select(item => item.Kind));
+        Assert.Null(compact.FilesText);
+        Assert.Null(compact.SubagentsText);
+        Assert.False(compact.ShowElapsed);
         Assert.True(compact.BatteryWidth < regular.BatteryWidth);
         Assert.True(compact.BatteryHeight < regular.BatteryHeight);
         Assert.True(compact.BatteryTerminalHeight < regular.BatteryTerminalHeight);
         Assert.True(compact.UsageSpacing < regular.UsageSpacing);
         Assert.True(compact.UsageMaxWidth < regular.UsageMaxWidth);
+    }
+
+    [Fact]
+    public void CompactActivePreview_PlacesSpinnerBeforeActivity()
+    {
+        var settings = new CodexWidgetSettings
+        {
+            Compact = true,
+            ShowPulse = true,
+            ShowActivity = true,
+        };
+
+        var presentation = PreviewPresentationFactory.Create(
+            settings,
+            isActive: true,
+            filesChangedCount: 3,
+            totalSubagents: 2);
+        var activity = Assert.Single(
+            presentation.Items,
+            item => item.Kind == PreviewIndicatorKind.Activity);
+
+        Assert.Equal(
+            [PreviewLeadingItem.Spinner, PreviewLeadingItem.Activity],
+            activity.LeadingItems);
+    }
+
+    [Fact]
+    public void CompactLayout_ExcludesDisabledUsageLimits()
+    {
+        var settings = new CodexWidgetSettings
+        {
+            Compact = true,
+            ShowFiveHourUsage = false,
+            ShowWeeklyUsage = true,
+        };
+
+        var presentation = PreviewPresentationFactory.Create(
+            settings,
+            isActive: false,
+            filesChangedCount: 3,
+            totalSubagents: 2);
+
+        Assert.Equal(
+            [PreviewIndicatorKind.Activity, PreviewIndicatorKind.WeeklyUsage],
+            presentation.Items.Select(item => item.Kind));
     }
 
     [Fact]

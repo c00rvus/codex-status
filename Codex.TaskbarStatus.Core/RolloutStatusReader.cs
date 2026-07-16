@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Text;
 using System.Text.Json;
 
 namespace Codex.TaskbarStatus.Core;
@@ -17,6 +18,7 @@ public sealed class RolloutStatusReader : IDisposable
         "patch_apply_end",
         "sub_agent_activity",
         "agent_message",
+        "user_message",
         "token_count",
     };
 
@@ -27,6 +29,7 @@ public sealed class RolloutStatusReader : IDisposable
     private static readonly TimeSpan DefaultFallbackRescanInterval = TimeSpan.FromSeconds(5);
     private const int ReadBufferSize = 16 * 1024;
     private const int CheckpointSize = 128;
+    private const int MaxTaskTitleLength = 120;
 
     private readonly string _sessionsRoot;
     private readonly TimeSpan _fallbackRescanInterval;
@@ -94,6 +97,32 @@ public sealed class RolloutStatusReader : IDisposable
             }
 
             return Rescan(now);
+        }
+    }
+
+    public IReadOnlyList<CodexExecutionState> ReadRecent(
+        IReadOnlySet<string>? prioritySessionIds = null,
+        int recentPathLimit = 32)
+    {
+        if (recentPathLimit < 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(recentPathLimit),
+                "The recent rollout path limit cannot be negative.");
+        }
+
+        lock (_sync)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+
+            if (!Directory.Exists(_sessionsRoot))
+            {
+                ResetForMissingRoot();
+                return [];
+            }
+
+            EnsureWatcher();
+            return ReadRecentCore(prioritySessionIds, recentPathLimit);
         }
     }
 
@@ -174,6 +203,115 @@ public sealed class RolloutStatusReader : IDisposable
         _rescanRequired = false;
         _nextFallbackRescanAtUtc = now + _fallbackRescanInterval;
         return selectedState;
+    }
+
+    private IReadOnlyList<CodexExecutionState> ReadRecentCore(
+        IReadOnlySet<string>? prioritySessionIds,
+        int recentPathLimit)
+    {
+        var paths = EnumerateRolloutPaths();
+        var presentPaths = new HashSet<string>(paths.Select(item => item.Path), PathComparer);
+        foreach (var stalePath in _entries.Keys.Where(path => !presentPaths.Contains(path)).ToArray())
+        {
+            _entries[stalePath].Dispose();
+            _entries.Remove(stalePath);
+        }
+
+        HashSet<string> priorityIds = prioritySessionIds is null
+            ? []
+            : prioritySessionIds
+                .Where(id => !string.IsNullOrWhiteSpace(id))
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var candidates = paths
+            .OrderByDescending(item => item.LastWriteTimeUtc)
+            .Take(recentPathLimit)
+            .ToDictionary(item => item.Path, item => item, PathComparer);
+
+        if (priorityIds.Count > 0)
+        {
+            foreach (var item in paths)
+            {
+                var fileName = Path.GetFileNameWithoutExtension(item.Path);
+                if (priorityIds.Any(id => fileName.EndsWith(id, StringComparison.OrdinalIgnoreCase)))
+                {
+                    candidates[item.Path] = item;
+                }
+            }
+        }
+
+        var statesBySession = new Dictionary<string, (CodexExecutionState State, string Path)>(
+            StringComparer.OrdinalIgnoreCase);
+
+        foreach (var candidate in candidates.Values.OrderByDescending(item => item.LastWriteTimeUtc))
+        {
+            if (!_entries.TryGetValue(candidate.Path, out var entry))
+            {
+                entry = new RolloutCacheEntry(candidate.Path);
+                _entries.Add(candidate.Path, entry);
+            }
+
+            if (!TryRefreshEntry(entry) || !entry.Eligible || entry.State is null)
+            {
+                continue;
+            }
+
+            var sessionKey = string.IsNullOrWhiteSpace(entry.State.SessionId)
+                ? $"path:{entry.Path}"
+                : entry.State.SessionId;
+            if (!statesBySession.TryGetValue(sessionKey, out var existing)
+                || entry.State.LastUpdatedAtUtc > existing.State.LastUpdatedAtUtc)
+            {
+                statesBySession[sessionKey] = (entry.State, entry.Path);
+            }
+        }
+
+        return statesBySession.Values
+            .OrderByDescending(item => item.State.LastUpdatedAtUtc)
+            .ThenBy(item => item.State.SessionId, StringComparer.OrdinalIgnoreCase)
+            .Select(item => CloneState(item.State))
+            .ToArray();
+    }
+
+    private List<(string Path, DateTime LastWriteTimeUtc)> EnumerateRolloutPaths()
+    {
+        var paths = new List<(string Path, DateTime LastWriteTimeUtc)>();
+
+        try
+        {
+            foreach (var path in Directory.EnumerateFiles(
+                         _sessionsRoot,
+                         "rollout-*.jsonl",
+                         SearchOption.AllDirectories))
+            {
+                try
+                {
+                    paths.Add((path, File.GetLastWriteTimeUtc(path)));
+                }
+                catch (IOException)
+                {
+                }
+                catch (UnauthorizedAccessException)
+                {
+                }
+            }
+        }
+        catch (IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
+
+        return paths;
+    }
+
+    private static CodexExecutionState CloneState(CodexExecutionState state)
+    {
+        return state with
+        {
+            FilesChanged = [.. state.FilesChanged],
+        };
     }
 
     private static bool TryRefreshEntry(RolloutCacheEntry entry)
@@ -280,6 +418,16 @@ public sealed class RolloutStatusReader : IDisposable
                 ProcessBytes(entry, buffer.AsSpan(0, count));
                 entry.BytesRead += count;
                 remaining -= count;
+
+                if (entry.Rejected)
+                {
+                    // session_meta is the first record in a rollout. Once it
+                    // identifies a subagent, skip the rest of what can be a
+                    // very large file without parsing each JSONL record.
+                    entry.PartialLine.SetLength(0);
+                    entry.BytesRead = targetLength;
+                    break;
+                }
             }
         }
         finally
@@ -311,6 +459,10 @@ public sealed class RolloutStatusReader : IDisposable
             }
 
             segmentStart = index + 1;
+            if (entry.Rejected)
+            {
+                return;
+            }
         }
 
         if (segmentStart < bytes.Length)
@@ -369,9 +521,11 @@ public sealed class RolloutStatusReader : IDisposable
             {
                 var threadSource = ReadString(payload, "thread_source");
                 var originator = ReadString(payload, "originator");
-                entry.Eligible = string.Equals(threadSource, "user", StringComparison.OrdinalIgnoreCase)
+                var parentThreadId = ReadString(payload, "parent_thread_id");
+                entry.Eligible = string.IsNullOrWhiteSpace(parentThreadId)
+                    && (string.Equals(threadSource, "user", StringComparison.OrdinalIgnoreCase)
                     || (string.IsNullOrWhiteSpace(threadSource)
-                        && string.Equals(originator, "Codex Desktop", StringComparison.OrdinalIgnoreCase));
+                        && string.Equals(originator, "Codex Desktop", StringComparison.OrdinalIgnoreCase)));
 
                 if (!entry.Eligible)
                 {
@@ -609,6 +763,7 @@ public sealed class RolloutStatusReader : IDisposable
                 state.Status = CodexExecutionStatuses.Running;
                 state.Activity = CodexActivityLabels.Running;
                 state.TurnId = ReadString(payload, "turn_id") ?? state.TurnId;
+                state.TaskTitle = null;
                 state.StartedAtUtc = timestamp;
                 state.StoppedAtUtc = null;
                 state.ErrorMessage = null;
@@ -683,12 +838,70 @@ public sealed class RolloutStatusReader : IDisposable
                 }
                 break;
 
+            case "user_message":
+                state.TaskTitle = NormalizeTaskTitle(ReadString(payload, "message"));
+                break;
+
             case "token_count":
                 ApplyTokens(state, payload);
                 break;
         }
 
         state.LastUpdatedAtUtc = timestamp;
+    }
+
+    private static string? NormalizeTaskTitle(string? message)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+        {
+            return null;
+        }
+
+        const string requestMarker = "## My request for Codex:";
+        var requestMarkerIndex = message.LastIndexOf(
+            requestMarker,
+            StringComparison.OrdinalIgnoreCase);
+        if (requestMarkerIndex >= 0)
+        {
+            message = message[(requestMarkerIndex + requestMarker.Length)..];
+        }
+
+        message = message.TrimStart();
+        while (message.StartsWith('#'))
+        {
+            message = message[1..].TrimStart();
+        }
+
+        var title = new StringBuilder(Math.Min(message.Length, MaxTaskTitleLength));
+        var pendingSpace = false;
+        foreach (var character in message)
+        {
+            if (char.IsWhiteSpace(character))
+            {
+                pendingSpace = title.Length > 0;
+                continue;
+            }
+
+            if (pendingSpace && title.Length < MaxTaskTitleLength)
+            {
+                if (title.Length + 1 >= MaxTaskTitleLength)
+                {
+                    break;
+                }
+
+                title.Append(' ');
+            }
+
+            pendingSpace = false;
+            if (title.Length >= MaxTaskTitleLength)
+            {
+                break;
+            }
+
+            title.Append(character);
+        }
+
+        return title.ToString();
     }
 
     private static void ApplyTokens(CodexExecutionState state, JsonElement payload)

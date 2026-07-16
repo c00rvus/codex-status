@@ -266,6 +266,159 @@ public sealed class RolloutStatusReaderTests : IDisposable
         Assert.Equal("new-user-turn", newest.TurnId);
     }
 
+    [Fact]
+    public async Task ReadRecent_ReturnsSimultaneousUserTasksAndRejectsParentThreads()
+    {
+        Directory.CreateDirectory(_directory);
+        var first = Path.Combine(_directory, "rollout-first-thread.jsonl");
+        await WriteRolloutAsync(
+            first,
+            SessionMeta("first-thread", "2026-07-15T10:00:00Z"),
+            TaskStarted("first-turn", "2026-07-15T10:00:01Z"));
+
+        var second = Path.Combine(_directory, "rollout-second-thread.jsonl");
+        await WriteRolloutAsync(
+            second,
+            SessionMeta("second-thread", "2026-07-15T10:01:00Z"),
+            TaskStarted("second-turn", "2026-07-15T10:01:01Z"));
+
+        var parented = Path.Combine(_directory, "rollout-parented-thread.jsonl");
+        await WriteRolloutAsync(
+            parented,
+            ParentedSessionMeta("parented-thread", "first-thread", "2026-07-15T10:02:00Z"),
+            TaskStarted("parented-turn", "2026-07-15T10:02:01Z"));
+
+        var subagent = Path.Combine(_directory, "rollout-subagent-thread.jsonl");
+        await WriteRolloutAsync(
+            subagent,
+            """{"timestamp":"2026-07-15T10:03:00Z","type":"session_meta","payload":{"id":"subagent-thread","thread_source":"subagent","originator":"Codex Desktop"}}""",
+            TaskStarted("subagent-turn", "2026-07-15T10:03:01Z"));
+
+        using var reader = new RolloutStatusReader(_directory);
+        var states = reader.ReadRecent();
+
+        Assert.Collection(
+            states,
+            state =>
+            {
+                Assert.Equal("second-thread", state.SessionId);
+                Assert.Equal("second-turn", state.TurnId);
+            },
+            state =>
+            {
+                Assert.Equal("first-thread", state.SessionId);
+                Assert.Equal("first-turn", state.TurnId);
+            });
+        Assert.DoesNotContain(states, state => state.SessionId == "parented-thread");
+        Assert.DoesNotContain(states, state => state.SessionId == "subagent-thread");
+    }
+
+    [Fact]
+    public async Task ReadRecent_UpdatesEachCachedSessionIndependently()
+    {
+        Directory.CreateDirectory(_directory);
+        var first = Path.Combine(_directory, "rollout-first-thread.jsonl");
+        await WriteRolloutAsync(
+            first,
+            SessionMeta("first-thread", "2026-07-15T11:00:00Z"),
+            TaskStarted("first-turn", "2026-07-15T11:00:01Z"));
+
+        var second = Path.Combine(_directory, "rollout-second-thread.jsonl");
+        await WriteRolloutAsync(
+            second,
+            SessionMeta("second-thread", "2026-07-15T11:01:00Z"),
+            TaskStarted("second-turn", "2026-07-15T11:01:01Z"));
+
+        using var reader = new RolloutStatusReader(_directory);
+        var initial = reader.ReadRecent();
+        Assert.Equal(2, initial.Count);
+
+        await File.AppendAllLinesAsync(first,
+        [
+            UserMessage("First task finished", "2026-07-15T11:02:00Z"),
+            TaskCompleted("first-turn", "2026-07-15T11:02:01Z"),
+        ]);
+
+        var updated = reader.ReadRecent();
+        var updatedFirst = Assert.Single(updated, state => state.SessionId == "first-thread");
+        var unchangedSecond = Assert.Single(updated, state => state.SessionId == "second-thread");
+
+        Assert.Equal(CodexExecutionStatuses.Completed, updatedFirst.Status);
+        Assert.Equal("First task finished", updatedFirst.TaskTitle);
+        Assert.Equal(CodexExecutionStatuses.Running, unchangedSecond.Status);
+        Assert.Equal("second-turn", unchangedSecond.TurnId);
+    }
+
+    [Fact]
+    public async Task ReadRecent_UsesPrioritySessionIdsBeyondRecentPathLimit()
+    {
+        Directory.CreateDirectory(_directory);
+        var priority = Path.Combine(_directory, "rollout-priority-thread.jsonl");
+        await WriteRolloutAsync(
+            priority,
+            SessionMeta("priority-thread", "2026-07-15T12:00:00Z"),
+            TaskStarted("priority-turn", "2026-07-15T12:00:01Z"));
+        File.SetLastWriteTimeUtc(priority, new DateTime(2026, 7, 15, 12, 0, 1, DateTimeKind.Utc));
+
+        var newest = Path.Combine(_directory, "rollout-newest-thread.jsonl");
+        await WriteRolloutAsync(
+            newest,
+            SessionMeta("newest-thread", "2026-07-15T12:10:00Z"),
+            TaskStarted("newest-turn", "2026-07-15T12:10:01Z"));
+        File.SetLastWriteTimeUtc(newest, new DateTime(2026, 7, 15, 12, 10, 1, DateTimeKind.Utc));
+
+        using var reader = new RolloutStatusReader(_directory);
+        var states = reader.ReadRecent(
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "priority-thread" },
+            recentPathLimit: 1);
+
+        Assert.Equal(2, states.Count);
+        Assert.Contains(states, state => state.SessionId == "newest-thread");
+        Assert.Contains(states, state => state.SessionId == "priority-thread");
+    }
+
+    [Fact]
+    public async Task ReadRecent_NormalizesLatestUserMessageAndReturnsIndependentCopies()
+    {
+        Directory.CreateDirectory(_directory);
+        var rollout = Path.Combine(_directory, "rollout-title-thread.jsonl");
+        var longMessage =
+            $"# Files mentioned by the user:\nattachment.png\n\n" +
+            $"## My request for Codex:\n  Improve\r\n\tthis   interface {new string('x', 150)}  ";
+        await WriteRolloutAsync(
+            rollout,
+            SessionMeta("title-thread", "2026-07-15T13:00:00Z"),
+            TaskStarted("title-turn", "2026-07-15T13:00:01Z"),
+            UserMessage(longMessage, "2026-07-15T13:00:02Z"),
+            PatchApplied("2026-07-15T13:00:03Z"));
+
+        using var reader = new RolloutStatusReader(_directory);
+        var first = Assert.Single(reader.ReadRecent());
+        var title = Assert.IsType<string>(first.TaskTitle);
+
+        Assert.Equal(120, title.Length);
+        Assert.StartsWith("Improve this interface ", title);
+        Assert.DoesNotContain('\r', title);
+        Assert.DoesNotContain('\n', title);
+
+        first.Status = CodexExecutionStatuses.Error;
+        first.TaskTitle = "mutated";
+        first.FilesChanged.Clear();
+
+        var second = Assert.Single(reader.ReadRecent());
+        Assert.Equal(CodexExecutionStatuses.Running, second.Status);
+        Assert.NotEqual("mutated", second.TaskTitle);
+        Assert.Equal("src/A.cs", Assert.Single(second.FilesChanged));
+
+        await File.AppendAllTextAsync(
+            rollout,
+            TaskStarted("next-turn", "2026-07-15T13:01:00Z") + Environment.NewLine);
+
+        var nextTurn = Assert.Single(reader.ReadRecent());
+        Assert.Equal("next-turn", nextTurn.TurnId);
+        Assert.Null(nextTurn.TaskTitle);
+    }
+
     private static async Task<CodexExecutionState?> WaitForStateAsync(
         RolloutStatusReader reader,
         Func<CodexExecutionState?, bool> predicate,
@@ -298,6 +451,11 @@ public sealed class RolloutStatusReaderTests : IDisposable
         return $$$"""{"timestamp":"{{{timestamp}}}","type":"session_meta","payload":{"id":"{{{sessionId}}}","thread_source":"user","originator":"Codex Desktop"}}""";
     }
 
+    private static string ParentedSessionMeta(string sessionId, string parentThreadId, string timestamp)
+    {
+        return $$$"""{"timestamp":"{{{timestamp}}}","type":"session_meta","payload":{"id":"{{{sessionId}}}","thread_source":"user","parent_thread_id":"{{{parentThreadId}}}","originator":"Codex Desktop"}}""";
+    }
+
     private static string TaskStarted(string turnId, string timestamp)
     {
         return $$$"""{"timestamp":"{{{timestamp}}}","type":"event_msg","payload":{"type":"task_started","turn_id":"{{{turnId}}}"}}""";
@@ -306,6 +464,11 @@ public sealed class RolloutStatusReaderTests : IDisposable
     private static string TaskCompleted(string turnId, string timestamp)
     {
         return $$$"""{"timestamp":"{{{timestamp}}}","type":"event_msg","payload":{"type":"task_complete","turn_id":"{{{turnId}}}"}}""";
+    }
+
+    private static string UserMessage(string message, string timestamp)
+    {
+        return $$$"""{"timestamp":"{{{timestamp}}}","type":"event_msg","payload":{"type":"user_message","message":{{{System.Text.Json.JsonSerializer.Serialize(message)}}}}}""";
     }
 
     private static string PatchApplied(string timestamp)

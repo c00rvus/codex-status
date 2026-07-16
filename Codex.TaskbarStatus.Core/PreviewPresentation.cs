@@ -211,11 +211,11 @@ public static class PreviewPresentationFactory
             {
                 PreviewIndicatorKind.Activity when leadingItems.Count > 0 =>
                     new(indicator, null, leadingItems),
-                PreviewIndicatorKind.Files when showFiles =>
+                PreviewIndicatorKind.Files when showFiles && !compact =>
                     new(indicator, FormatCount(filesChangedCount, "file", "files"), []),
-                PreviewIndicatorKind.Subagents when showSubagents =>
+                PreviewIndicatorKind.Subagents when showSubagents && !compact =>
                     new(indicator, FormatCount(totalSubagents, "subagent", "subagents"), []),
-                PreviewIndicatorKind.Elapsed when showElapsed =>
+                PreviewIndicatorKind.Elapsed when showElapsed && !compact =>
                     new(indicator, null, []),
                 PreviewIndicatorKind.FiveHourUsage when showFiveHourUsage =>
                     new(indicator, null, []),
@@ -237,7 +237,7 @@ public static class PreviewPresentationFactory
             compact ? 78 : 92,
             compact ? 4 : 8,
             compact ? 3 : 4,
-            compact ? 3 : 8,
+            compact ? 6 : 8,
             compact ? 3 : 6,
             compact ? 11 : 12,
             compact ? 13 : 14,
