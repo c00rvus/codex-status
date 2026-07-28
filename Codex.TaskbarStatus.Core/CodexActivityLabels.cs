@@ -8,6 +8,7 @@ public static class CodexActivityLabels
     public const string ProcessingRequest = "Processing request";
     public const string ApplyingChanges = "Applying changes";
     public const string WaitingForPermission = "Waiting for permission";
+    public const string WaitingForInput = "Waiting for input";
     public const string ProcessingResult = "Processing result";
     public const string RunningSubagent = "Running subagent";
     public const string ProcessingSubagentResult = "Processing subagent result";

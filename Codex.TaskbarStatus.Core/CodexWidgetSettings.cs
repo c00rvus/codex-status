@@ -24,6 +24,7 @@ public sealed class CodexWidgetSettings
     public bool ShowFiveHourUsage { get; set; } = true;
     public bool ShowWeeklyUsage { get; set; } = true;
     public bool ShowPulse { get; set; } = true;
+    public bool ShowAttentionNotifications { get; set; } = true;
     public bool Compact { get; set; }
     public bool HideWhenIdle { get; set; }
 
@@ -65,6 +66,10 @@ public sealed class CodexWidgetSettings
                 "showWeeklyUsage",
                 settings.ShowWeeklyUsage);
             settings.ShowPulse = ReadBoolean(root, "showPulse", settings.ShowPulse);
+            settings.ShowAttentionNotifications = ReadBoolean(
+                root,
+                "showAttentionNotifications",
+                settings.ShowAttentionNotifications);
             settings.Compact = ReadBoolean(root, "compact", settings.Compact);
             settings.HideWhenIdle = ReadBoolean(root, "hideWhenIdle", settings.HideWhenIdle);
 

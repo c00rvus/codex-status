@@ -19,12 +19,19 @@ internal sealed class TrayIconService : IDisposable
     private const uint NifMessage = 0x00000001;
     private const uint NifIcon = 0x00000002;
     private const uint NifTip = 0x00000004;
+    private const uint NifInfo = 0x00000010;
     private const uint NifShowTip = 0x00000080;
 
     private const uint NimAdd = 0x00000000;
+    private const uint NimModify = 0x00000001;
     private const uint NimDelete = 0x00000002;
     private const uint NimSetVersion = 0x00000004;
     private const uint NotifyIconVersion4 = 4;
+    private const uint NiifWarning = 0x00000002;
+    private const uint NiifError = 0x00000003;
+    private const uint NinBalloonHide = 0x0403;
+    private const uint NinBalloonTimeout = 0x0404;
+    private const uint NinBalloonUserClick = 0x0405;
 
     private const uint MfString = 0x00000000;
     private const uint MfSeparator = 0x00000800;
@@ -59,6 +66,7 @@ internal sealed class TrayIconService : IDisposable
     private bool _usesVersion4;
     private bool _classRegistered;
     private bool _disposed;
+    private Action? _balloonAction;
 
     internal TrayIconService(
         Action openSettings,
@@ -96,6 +104,33 @@ internal sealed class TrayIconService : IDisposable
 
     internal bool IsIconVisible => _iconAdded;
 
+    internal bool ShowNotification(
+        string title,
+        string message,
+        bool isError,
+        Action? action = null)
+    {
+        if (_disposed || !_iconAdded || _window == nint.Zero)
+        {
+            return false;
+        }
+
+        var data = CreateIconData();
+        data.Flags = NifInfo;
+        data.InfoTitle = Truncate(title, 63);
+        data.Info = Truncate(message, 255);
+        data.InfoFlags = isError ? NiifError : NiifWarning;
+        data.TimeoutOrVersion = 10_000;
+        _balloonAction = action;
+        if (ShellNotifyIcon(NimModify, ref data))
+        {
+            return true;
+        }
+
+        _balloonAction = null;
+        return false;
+    }
+
     public void Dispose()
     {
         if (_disposed)
@@ -104,6 +139,7 @@ internal sealed class TrayIconService : IDisposable
         }
 
         _disposed = true;
+        _balloonAction = null;
 
         if (_window != nint.Zero)
         {
@@ -300,6 +336,20 @@ internal sealed class TrayIconService : IDisposable
 
     private void HandleNotification(uint notification, nint callbackData)
     {
+        if (notification == NinBalloonUserClick)
+        {
+            var action = _balloonAction;
+            _balloonAction = null;
+            (action ?? _showDetails)();
+            return;
+        }
+
+        if (notification is NinBalloonHide or NinBalloonTimeout)
+        {
+            _balloonAction = null;
+            return;
+        }
+
         if (_activationFilter.ShouldOpenSettings(
                 notification,
                 _usesVersion4,
@@ -315,6 +365,19 @@ internal sealed class TrayIconService : IDisposable
                 ? Point.FromPacked(callbackData)
                 : null);
         }
+    }
+
+    private static string Truncate(string? value, int maximumLength)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return string.Empty;
+        }
+
+        var normalized = value.Replace("\r", string.Empty).Trim();
+        return normalized.Length <= maximumLength
+            ? normalized
+            : normalized[..Math.Max(0, maximumLength - 1)] + "…";
     }
 
     private void ShowContextMenu(Point? callbackPosition = null)

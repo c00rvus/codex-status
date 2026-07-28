@@ -3,6 +3,7 @@ using Codex.TaskbarStatus.Standalone.Hosting;
 using Codex.TaskbarStatus.Standalone.Widget;
 using Microsoft.UI.Dispatching;
 using Microsoft.UI.Xaml;
+using System.Diagnostics;
 
 namespace Codex.TaskbarStatus.Standalone;
 
@@ -38,6 +39,9 @@ internal sealed class StandaloneHost
         _context = new StandaloneWidgetContext(_settings.WidgetSettingsJson);
         _context.PreviewRefreshRequested += RefreshPreview;
         _context.OpenFlyoutRequested += ToggleFlyout;
+        _context.FlyoutResizeRequested += ResizeFlyout;
+        _context.OpenTaskRequested += OpenTask;
+        _context.AttentionNotificationRequested += ShowAttentionNotification;
 
         await _widget.InitializeAsync(_context);
         var previewContent = _widget.CreatePreviewContent()
@@ -138,6 +142,59 @@ internal sealed class StandaloneHost
         _flyoutWindow.Show(
             _previewWindow.ScreenBounds,
             _previewWindow.Dpi);
+    }
+
+    private void ResizeFlyout(int logicalHeight)
+    {
+        if (_exiting)
+        {
+            return;
+        }
+
+        _flyoutWindow?.UpdateLogicalHeight(logicalHeight);
+    }
+
+    private void OpenTask(string sessionId)
+    {
+        if (_exiting || !CodexTaskDeepLink.TryCreate(sessionId, out var uri) || uri is null)
+        {
+            return;
+        }
+
+        _flyoutWindow?.Hide();
+        try
+        {
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = uri.AbsoluteUri,
+                UseShellExecute = true,
+            });
+            StandaloneLog.Write($"Opened Codex task {sessionId}.");
+        }
+        catch (Exception exception) when (
+            exception is InvalidOperationException or System.ComponentModel.Win32Exception)
+        {
+            StandaloneLog.Write("Opening the Codex task failed", exception);
+            _trayIcon?.ShowNotification(
+                "Could not open Codex",
+                "Open Codex manually and select the task from its history.",
+                isError: true,
+                ShowDetails);
+        }
+    }
+
+    private void ShowAttentionNotification(WidgetAttentionNotification notification)
+    {
+        if (_exiting)
+        {
+            return;
+        }
+
+        _trayIcon?.ShowNotification(
+            notification.IsError ? "Codex task failed" : "Codex needs attention",
+            $"{notification.Title}\n{notification.Message}",
+            notification.IsError,
+            ShowDetails);
     }
 
     private bool EnsureFlyout()

@@ -11,10 +11,13 @@ internal sealed class CodexStatusSnapshot
     public string? TurnId { get; init; }
     public string? Cwd { get; init; }
     public string? Model { get; init; }
+    public string? CurrentTool { get; init; }
+    public string? ErrorMessage { get; init; }
     public int ToolCount { get; init; }
     public int FilesChangedCount { get; init; }
     public int TotalSubagents { get; init; }
     public DateTimeOffset? StartedAtUtc { get; init; }
+    public DateTimeOffset? WaitingSinceAtUtc { get; init; }
     public DateTimeOffset? StoppedAtUtc { get; init; }
     public DateTimeOffset LastUpdatedAtUtc { get; init; } = DateTimeOffset.MinValue;
     public string Source { get; init; } = "None";
@@ -22,8 +25,17 @@ internal sealed class CodexStatusSnapshot
 
     public bool IsActive => CodexStatusReader.IsActiveState(Status, StoppedAtUtc);
 
+    public bool RequiresAttention =>
+        Status is CodexExecutionStatuses.Waiting or CodexExecutionStatuses.Error;
+
+    public bool ShouldNotifyAttention =>
+        Status == CodexExecutionStatuses.Waiting ||
+        (Status == CodexExecutionStatuses.Error && StoppedAtUtc is not null);
+
     public string TaskKey => !string.IsNullOrWhiteSpace(SessionId)
-        ? $"session:{SessionId}|turn:{TurnId ?? string.Empty}"
+        ? !string.IsNullOrWhiteSpace(TurnId)
+            ? $"session:{SessionId}|turn:{TurnId}"
+            : $"session:{SessionId}|started:{StartedAtUtc?.UtcTicks ?? 0}"
         : $"source:{Source}|started:{StartedAtUtc?.UtcTicks ?? 0}";
 
     public TimeSpan Elapsed(DateTimeOffset now)
@@ -48,7 +60,12 @@ internal sealed class CodexStatusBoardSnapshot
 
     public int ActiveCount => Tasks.Count(task => task.IsActive);
 
-    public int ReadyCount => Tasks.Count(task => !task.IsActive);
+    public int RunningCount =>
+        Tasks.Count(task => task.Status == CodexExecutionStatuses.Running);
+
+    public int ReadyCount => Tasks.Count(task => !task.IsActive && !task.RequiresAttention);
+
+    public int AttentionCount => Tasks.Count(task => task.RequiresAttention);
 }
 
 internal sealed class CodexStatusReader : IDisposable
@@ -58,41 +75,55 @@ internal sealed class CodexStatusReader : IDisposable
     private static readonly TimeSpan MissingUnreadSignalRetention = TimeSpan.FromMinutes(15);
 
     private readonly StatusFileStore _statusStore = new();
+    private readonly StatusSessionStore _statusSessionStore = new();
     private readonly RolloutStatusReader _rolloutReader = new();
     private readonly CodexDesktopUnreadThreadReader _unreadReader = new();
+    private IReadOnlyList<CodexExecutionState> _cachedHookStates = [];
     private IReadOnlyList<CodexExecutionState> _cachedRollouts = [];
     private DateTimeOffset _nextRolloutReadAt = DateTimeOffset.MinValue;
 
     public CodexStatusSnapshot Read() => ReadBoard().Primary;
 
-    public CodexStatusBoardSnapshot ReadBoard()
+    public CodexStatusBoardSnapshot ReadBoard(
+        IReadOnlySet<string>? reviewedTaskKeys = null)
     {
         var now = DateTimeOffset.UtcNow;
         var unread = _unreadReader.Read();
-        var hookState = File.Exists(StatusFileStore.DefaultPath) ? _statusStore.Read() : null;
 
         if (now >= _nextRolloutReadAt)
         {
+            _cachedHookStates = ReadHookStates();
             _cachedRollouts = _rolloutReader.ReadRecent(unread.ThreadIds);
             _nextRolloutReadAt = now + RolloutRefreshInterval;
         }
 
-        var states = BuildMergedStates(hookState, _cachedRollouts);
+        var states = BuildMergedStates(_cachedHookStates, _cachedRollouts);
         var mapped = states
             .Select(item => Map(
                 item.State,
                 item.Source,
                 item.State.SessionId is { } sessionId && unread.ThreadIds.Contains(sessionId)))
             .ToArray();
+        var visibleMapped = reviewedTaskKeys is null || reviewedTaskKeys.Count == 0
+            ? mapped
+            : mapped
+                .Where(snapshot =>
+                    snapshot.IsActive ||
+                    !reviewedTaskKeys.Contains(snapshot.TaskKey))
+                .ToArray();
 
-        var primary = mapped
+        var primary = visibleMapped
+            .Where(snapshot => snapshot.RequiresAttention && IsFresh(snapshot, now))
+            .OrderByDescending(snapshot => snapshot.LastUpdatedAtUtc)
+            .FirstOrDefault()
+            ?? visibleMapped
             .Where(snapshot => snapshot.IsActive && IsFreshActive(snapshot, now))
             .OrderByDescending(snapshot => snapshot.LastUpdatedAtUtc)
             .FirstOrDefault()
-            ?? mapped.OrderByDescending(snapshot => snapshot.LastUpdatedAtUtc).FirstOrDefault()
+            ?? visibleMapped.OrderByDescending(snapshot => snapshot.LastUpdatedAtUtc).FirstOrDefault()
             ?? new CodexStatusSnapshot();
 
-        var tasks = mapped
+        var tasks = visibleMapped
             .Where(snapshot => ShouldShowInTaskList(snapshot, unread.IsAvailable, now))
             .OrderByDescending(snapshot => snapshot.IsActive)
             .ThenByDescending(snapshot => snapshot.LastUpdatedAtUtc)
@@ -121,8 +152,25 @@ internal sealed class CodexStatusReader : IDisposable
             or CodexExecutionStatuses.Error;
     }
 
+    private IReadOnlyList<CodexExecutionState> ReadHookStates()
+    {
+        var states = _statusSessionStore.ReadRecent().ToList();
+        if (File.Exists(StatusFileStore.DefaultPath))
+        {
+            states.Add(_statusStore.Read());
+        }
+
+        return states
+            .Where(state => state.Status != CodexExecutionStatuses.Idle)
+            .GroupBy(StateIdentity, StringComparer.Ordinal)
+            .Select(group => group
+                .OrderByDescending(state => state.LastUpdatedAtUtc)
+                .First())
+            .ToArray();
+    }
+
     private static IReadOnlyList<(CodexExecutionState State, string Source)> BuildMergedStates(
-        CodexExecutionState? hookState,
+        IReadOnlyList<CodexExecutionState> hookStates,
         IReadOnlyList<CodexExecutionState> rolloutStates)
     {
         var states = rolloutStates
@@ -131,27 +179,25 @@ internal sealed class CodexStatusReader : IDisposable
                 Source: "Local session (fallback)"))
             .ToList();
 
-        if (hookState is null)
+        foreach (var hookState in hookStates)
         {
-            return states;
-        }
+            var matchingIndex = !string.IsNullOrWhiteSpace(hookState.SessionId)
+                ? states.FindIndex(item => string.Equals(
+                    item.State.SessionId,
+                    hookState.SessionId,
+                    StringComparison.Ordinal))
+                : -1;
 
-        var matchingIndex = !string.IsNullOrWhiteSpace(hookState.SessionId)
-            ? states.FindIndex(item => string.Equals(
-                item.State.SessionId,
-                hookState.SessionId,
-                StringComparison.Ordinal))
-            : -1;
-
-        if (matchingIndex >= 0)
-        {
-            states[matchingIndex] = (
-                Merge(hookState, states[matchingIndex].State),
-                "Hooks + local session");
-        }
-        else if (IsActiveState(hookState.Status, hookState.StoppedAtUtc) || states.Count == 0)
-        {
-            states.Add((hookState, "Hooks"));
+            if (matchingIndex >= 0)
+            {
+                states[matchingIndex] = (
+                    Merge(hookState, states[matchingIndex].State),
+                    "Hooks + local session");
+            }
+            else if (IsActiveState(hookState.Status, hookState.StoppedAtUtc) || states.Count == 0)
+            {
+                states.Add((hookState, "Hooks"));
+            }
         }
 
         return states;
@@ -204,18 +250,38 @@ internal sealed class CodexStatusReader : IDisposable
         snapshot.LastUpdatedAtUtc == DateTimeOffset.MinValue
         || now - snapshot.LastUpdatedAtUtc <= AbandonedActiveAge;
 
-    private static CodexExecutionState Merge(
+    private static bool IsFresh(CodexStatusSnapshot snapshot, DateTimeOffset now) =>
+        snapshot.LastUpdatedAtUtc == DateTimeOffset.MinValue
+        || now - snapshot.LastUpdatedAtUtc <= AbandonedActiveAge;
+
+    internal static CodexExecutionState Merge(
         CodexExecutionState hookState,
         CodexExecutionState rolloutState)
     {
-        var rolloutIsNewer = rolloutState.LastUpdatedAtUtc >= hookState.LastUpdatedAtUtc;
+        var differentKnownTurns =
+            !string.IsNullOrWhiteSpace(hookState.TurnId) &&
+            !string.IsNullOrWhiteSpace(rolloutState.TurnId) &&
+            !string.Equals(
+                hookState.TurnId,
+                rolloutState.TurnId,
+                StringComparison.Ordinal);
+        var hookHasPendingAttention =
+            !differentKnownTurns &&
+            hookState.Status == CodexExecutionStatuses.Waiting &&
+            hookState.WaitingSinceAtUtc is not null;
+        var rolloutIsNewer =
+            !hookHasPendingAttention &&
+            rolloutState.LastUpdatedAtUtc >= hookState.LastUpdatedAtUtc;
+        var newerState = rolloutIsNewer ? rolloutState : hookState;
         return new CodexExecutionState
         {
             Status = rolloutIsNewer ? rolloutState.Status : hookState.Status,
             Activity = rolloutIsNewer ? rolloutState.Activity : hookState.Activity,
-            TaskTitle = rolloutIsNewer
-                ? rolloutState.TaskTitle ?? hookState.TaskTitle
-                : hookState.TaskTitle ?? rolloutState.TaskTitle,
+            TaskTitle = differentKnownTurns
+                ? newerState.TaskTitle
+                : rolloutIsNewer
+                    ? rolloutState.TaskTitle ?? hookState.TaskTitle
+                    : hookState.TaskTitle ?? rolloutState.TaskTitle,
             SessionId = hookState.SessionId ?? rolloutState.SessionId,
             TurnId = rolloutIsNewer
                 ? rolloutState.TurnId ?? hookState.TurnId
@@ -223,26 +289,63 @@ internal sealed class CodexStatusReader : IDisposable
             TranscriptPath = hookState.TranscriptPath ?? rolloutState.TranscriptPath,
             Cwd = hookState.Cwd ?? rolloutState.Cwd,
             Model = hookState.Model ?? rolloutState.Model,
-            ToolCount = Math.Max(hookState.ToolCount, rolloutState.ToolCount),
-            FilesChanged = hookState.FilesChanged
-                .Concat(rolloutState.FilesChanged)
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .ToList(),
-            ActiveSubagents = hookState.ActiveSubagents,
-            TotalSubagents = Math.Max(hookState.TotalSubagents, rolloutState.TotalSubagents),
-            InputTokens = Math.Max(hookState.InputTokens, rolloutState.InputTokens),
-            OutputTokens = Math.Max(hookState.OutputTokens, rolloutState.OutputTokens),
-            TotalTokens = Math.Max(hookState.TotalTokens, rolloutState.TotalTokens),
+            CurrentTool = differentKnownTurns
+                ? newerState.CurrentTool
+                : hookHasPendingAttention
+                    ? hookState.CurrentTool
+                    : rolloutIsNewer
+                        ? rolloutState.CurrentTool ?? hookState.CurrentTool
+                        : hookState.CurrentTool ?? rolloutState.CurrentTool,
+            ErrorMessage = differentKnownTurns
+                ? newerState.ErrorMessage
+                : rolloutIsNewer
+                    ? rolloutState.ErrorMessage ?? hookState.ErrorMessage
+                    : hookState.ErrorMessage ?? rolloutState.ErrorMessage,
+            ToolCount = differentKnownTurns
+                ? newerState.ToolCount
+                : Math.Max(hookState.ToolCount, rolloutState.ToolCount),
+            FilesChanged = differentKnownTurns
+                ? [.. newerState.FilesChanged]
+                : hookState.FilesChanged
+                    .Concat(rolloutState.FilesChanged)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList(),
+            ActiveSubagents = differentKnownTurns
+                ? newerState.ActiveSubagents
+                : hookState.ActiveSubagents,
+            TotalSubagents = differentKnownTurns
+                ? newerState.TotalSubagents
+                : Math.Max(hookState.TotalSubagents, rolloutState.TotalSubagents),
+            InputTokens = differentKnownTurns
+                ? newerState.InputTokens
+                : Math.Max(hookState.InputTokens, rolloutState.InputTokens),
+            OutputTokens = differentKnownTurns
+                ? newerState.OutputTokens
+                : Math.Max(hookState.OutputTokens, rolloutState.OutputTokens),
+            TotalTokens = differentKnownTurns
+                ? newerState.TotalTokens
+                : Math.Max(hookState.TotalTokens, rolloutState.TotalTokens),
             ModelContextWindow = hookState.ModelContextWindow ?? rolloutState.ModelContextWindow,
-            StartedAtUtc = rolloutIsNewer
-                ? rolloutState.StartedAtUtc ?? hookState.StartedAtUtc
-                : hookState.StartedAtUtc ?? rolloutState.StartedAtUtc,
-            StoppedAtUtc = rolloutIsNewer
-                ? rolloutState.StoppedAtUtc ?? hookState.StoppedAtUtc
-                : hookState.StoppedAtUtc ?? rolloutState.StoppedAtUtc,
-            LastUpdatedAtUtc = rolloutIsNewer
-                ? rolloutState.LastUpdatedAtUtc
-                : hookState.LastUpdatedAtUtc,
+            StartedAtUtc = differentKnownTurns
+                ? newerState.StartedAtUtc
+                : rolloutIsNewer
+                    ? rolloutState.StartedAtUtc ?? hookState.StartedAtUtc
+                    : hookState.StartedAtUtc ?? rolloutState.StartedAtUtc,
+            WaitingSinceAtUtc = differentKnownTurns
+                ? newerState.WaitingSinceAtUtc
+                : hookHasPendingAttention
+                    ? hookState.WaitingSinceAtUtc
+                    : rolloutIsNewer
+                        ? rolloutState.WaitingSinceAtUtc ?? hookState.WaitingSinceAtUtc
+                        : hookState.WaitingSinceAtUtc ?? rolloutState.WaitingSinceAtUtc,
+            StoppedAtUtc = differentKnownTurns
+                ? newerState.StoppedAtUtc
+                : rolloutIsNewer
+                    ? rolloutState.StoppedAtUtc ?? hookState.StoppedAtUtc
+                    : hookState.StoppedAtUtc ?? rolloutState.StoppedAtUtc,
+            LastUpdatedAtUtc = hookState.LastUpdatedAtUtc >= rolloutState.LastUpdatedAtUtc
+                ? hookState.LastUpdatedAtUtc
+                : rolloutState.LastUpdatedAtUtc,
         };
     }
 
@@ -260,10 +363,13 @@ internal sealed class CodexStatusReader : IDisposable
             TurnId = state.TurnId,
             Cwd = state.Cwd,
             Model = state.Model,
+            CurrentTool = state.CurrentTool,
+            ErrorMessage = state.ErrorMessage,
             ToolCount = state.ToolCount,
             FilesChangedCount = state.FilesChanged.Count,
             TotalSubagents = state.TotalSubagents,
             StartedAtUtc = state.StartedAtUtc,
+            WaitingSinceAtUtc = state.WaitingSinceAtUtc,
             StoppedAtUtc = state.StoppedAtUtc,
             LastUpdatedAtUtc = state.LastUpdatedAtUtc,
             Source = source,

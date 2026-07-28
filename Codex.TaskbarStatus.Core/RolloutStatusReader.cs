@@ -517,7 +517,8 @@ public sealed class RolloutStatusReader : IDisposable
             }
 
             var timestamp = ReadTimestamp(root);
-            if (rowType.GetString() == "session_meta")
+            var rowTypeName = rowType.GetString();
+            if (rowTypeName == "session_meta")
             {
                 var threadSource = ReadString(payload, "thread_source");
                 var originator = ReadString(payload, "originator");
@@ -550,7 +551,21 @@ public sealed class RolloutStatusReader : IDisposable
                 return;
             }
 
-            if (!entry.Eligible || entry.State is null || rowType.GetString() != "event_msg")
+            if (!entry.Eligible || entry.State is null)
+            {
+                return;
+            }
+
+            if (rowTypeName == "response_item")
+            {
+                ApplyResponseItem(
+                    entry,
+                    payload,
+                    timestamp ?? entry.State.LastUpdatedAtUtc);
+                return;
+            }
+
+            if (rowTypeName != "event_msg")
             {
                 return;
             }
@@ -566,7 +581,67 @@ public sealed class RolloutStatusReader : IDisposable
                 payload,
                 eventType,
                 timestamp ?? entry.State.LastUpdatedAtUtc);
+
+            if (eventType is "task_started" or "task_complete" or "turn_aborted")
+            {
+                entry.PendingInputCallIds.Clear();
+            }
         }
+    }
+
+    private static void ApplyResponseItem(
+        RolloutCacheEntry entry,
+        JsonElement payload,
+        DateTimeOffset timestamp)
+    {
+        var state = entry.State;
+        if (state is null)
+        {
+            return;
+        }
+
+        var itemType = ReadString(payload, "type");
+        var callId = ReadString(payload, "call_id");
+        if (itemType == "function_call" &&
+            string.Equals(
+                ReadString(payload, "name"),
+                "request_user_input",
+                StringComparison.Ordinal))
+        {
+            if (!string.IsNullOrWhiteSpace(callId))
+            {
+                entry.PendingInputCallIds.Add(callId);
+            }
+
+            state.Status = CodexExecutionStatuses.Waiting;
+            state.Activity = CodexActivityLabels.WaitingForInput;
+            state.CurrentTool = "request_user_input";
+            state.WaitingSinceAtUtc = timestamp;
+            state.LastUpdatedAtUtc = timestamp;
+            return;
+        }
+
+        if (itemType != "function_call_output" ||
+            string.IsNullOrWhiteSpace(callId) ||
+            !entry.PendingInputCallIds.Remove(callId))
+        {
+            return;
+        }
+
+        if (entry.PendingInputCallIds.Count == 0 &&
+            state.Status == CodexExecutionStatuses.Waiting &&
+            string.Equals(
+                state.CurrentTool,
+                "request_user_input",
+                StringComparison.Ordinal))
+        {
+            state.Status = CodexExecutionStatuses.Running;
+            state.Activity = CodexActivityLabels.ProcessingRequest;
+            state.CurrentTool = null;
+            state.WaitingSinceAtUtc = null;
+        }
+
+        state.LastUpdatedAtUtc = timestamp;
     }
 
     private static bool CheckpointMatches(FileStream stream, RolloutCacheEntry entry)
@@ -767,6 +842,8 @@ public sealed class RolloutStatusReader : IDisposable
                 state.StartedAtUtc = timestamp;
                 state.StoppedAtUtc = null;
                 state.ErrorMessage = null;
+                state.CurrentTool = null;
+                state.WaitingSinceAtUtc = null;
                 state.ToolCount = 0;
                 state.FilesChanged = [];
                 state.ActiveSubagents = 0;
@@ -779,6 +856,8 @@ public sealed class RolloutStatusReader : IDisposable
                 state.TurnId = ReadString(payload, "turn_id") ?? state.TurnId;
                 state.StoppedAtUtc = timestamp;
                 state.ActiveSubagents = 0;
+                state.CurrentTool = null;
+                state.WaitingSinceAtUtc = null;
                 break;
 
             case "turn_aborted":
@@ -787,6 +866,8 @@ public sealed class RolloutStatusReader : IDisposable
                 state.TurnId = ReadString(payload, "turn_id") ?? state.TurnId;
                 state.StoppedAtUtc = timestamp;
                 state.ActiveSubagents = 0;
+                state.CurrentTool = null;
+                state.WaitingSinceAtUtc = null;
                 break;
 
             case "patch_apply_end":
@@ -986,6 +1067,9 @@ public sealed class RolloutStatusReader : IDisposable
 
         public MemoryStream PartialLine { get; } = new();
 
+        public HashSet<string> PendingInputCallIds { get; } =
+            new(StringComparer.Ordinal);
+
         public CodexExecutionState? State { get; set; }
 
         public long BytesRead { get; set; }
@@ -1011,6 +1095,7 @@ public sealed class RolloutStatusReader : IDisposable
             Eligible = false;
             Rejected = false;
             PartialLine.SetLength(0);
+            PendingInputCallIds.Clear();
             CheckpointOffset = 0;
             Checkpoint = [];
         }

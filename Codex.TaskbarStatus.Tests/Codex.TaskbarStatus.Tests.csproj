@@ -26,6 +26,8 @@
   <ItemGroup>
     <Compile Include="..\Codex.TaskbarStatus.Standalone\Hosting\TrayIconActivationFilter.cs"
              Link="Hosting\TrayIconActivationFilter.cs" />
+    <Compile Include="..\Codex.TaskbarStatus.Standalone\Services\CodexStatusReader.cs"
+             Link="Services\CodexStatusReader.cs" />
   </ItemGroup>
 
 </Project>

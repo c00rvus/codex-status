@@ -1,5 +1,12 @@
 namespace Codex.TaskbarStatus.Standalone.Widget;
 
+internal sealed record WidgetAttentionNotification(
+    string TaskKey,
+    string? SessionId,
+    string Title,
+    string Message,
+    bool IsError);
+
 internal interface IWidgetRuntimeContext
 {
     string SettingsJson { get; }
@@ -7,6 +14,12 @@ internal interface IWidgetRuntimeContext
     void RequestPreviewRefresh();
 
     void RequestOpenFlyout();
+
+    void RequestFlyoutResize(int logicalHeight);
+
+    void RequestOpenTask(string sessionId);
+
+    void RequestAttentionNotification(WidgetAttentionNotification notification);
 }
 
 internal interface IWidgetSettingsContext

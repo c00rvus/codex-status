@@ -419,6 +419,69 @@ public sealed class RolloutStatusReaderTests : IDisposable
         Assert.Null(nextTurn.TaskTitle);
     }
 
+    [Fact]
+    public async Task ReadRecent_RequestUserInputWaitsForMatchingOutput()
+    {
+        Directory.CreateDirectory(_directory);
+        var rollout = Path.Combine(_directory, "rollout-input-thread.jsonl");
+        await WriteRolloutAsync(
+            rollout,
+            SessionMeta("input-thread", "2026-07-28T20:00:00Z"),
+            TaskStarted("input-turn", "2026-07-28T20:00:01Z"),
+            RequestUserInput("input-call", "2026-07-28T20:00:02Z"));
+
+        using var reader = new RolloutStatusReader(_directory);
+        var waiting = Assert.Single(reader.ReadRecent());
+        Assert.Equal(CodexExecutionStatuses.Waiting, waiting.Status);
+        Assert.Equal(CodexActivityLabels.WaitingForInput, waiting.Activity);
+        Assert.Equal(DateTimeOffset.Parse("2026-07-28T20:00:02Z"), waiting.WaitingSinceAtUtc);
+
+        await File.AppendAllTextAsync(
+            rollout,
+            FunctionCallOutput("different-call", "2026-07-28T20:00:03Z") +
+            Environment.NewLine);
+        Assert.Equal(CodexExecutionStatuses.Waiting, Assert.Single(reader.ReadRecent()).Status);
+
+        await File.AppendAllTextAsync(
+            rollout,
+            FunctionCallOutput("input-call", "2026-07-28T20:00:04Z") +
+            Environment.NewLine);
+        var resumed = Assert.Single(reader.ReadRecent());
+        Assert.Equal(CodexExecutionStatuses.Running, resumed.Status);
+        Assert.Equal(CodexActivityLabels.ProcessingRequest, resumed.Activity);
+        Assert.Null(resumed.WaitingSinceAtUtc);
+    }
+
+    [Fact]
+    public async Task ReadRecent_RequestUserInputTracksMultiplePendingCalls()
+    {
+        Directory.CreateDirectory(_directory);
+        var rollout = Path.Combine(_directory, "rollout-multiple-inputs.jsonl");
+        await WriteRolloutAsync(
+            rollout,
+            SessionMeta("multiple-inputs", "2026-07-28T21:00:00Z"),
+            TaskStarted("multiple-turn", "2026-07-28T21:00:01Z"),
+            RequestUserInput("call-a", "2026-07-28T21:00:02Z"),
+            RequestUserInput("call-b", "2026-07-28T21:00:03Z"));
+
+        using var reader = new RolloutStatusReader(_directory);
+        Assert.Equal(CodexExecutionStatuses.Waiting, Assert.Single(reader.ReadRecent()).Status);
+
+        await File.AppendAllTextAsync(
+            rollout,
+            FunctionCallOutput("call-a", "2026-07-28T21:00:04Z") +
+            Environment.NewLine);
+        Assert.Equal(CodexExecutionStatuses.Waiting, Assert.Single(reader.ReadRecent()).Status);
+
+        await File.AppendAllTextAsync(
+            rollout,
+            TaskCompleted("multiple-turn", "2026-07-28T21:00:05Z") +
+            Environment.NewLine);
+        var completed = Assert.Single(reader.ReadRecent());
+        Assert.Equal(CodexExecutionStatuses.Completed, completed.Status);
+        Assert.Null(completed.WaitingSinceAtUtc);
+    }
+
     private static async Task<CodexExecutionState?> WaitForStateAsync(
         RolloutStatusReader reader,
         Func<CodexExecutionState?, bool> predicate,
@@ -480,6 +543,16 @@ public sealed class RolloutStatusReaderTests : IDisposable
     private static string AgentMessage(string timestamp)
     {
         return $$$"""{"timestamp":"{{{timestamp}}}","type":"event_msg","payload":{"type":"agent_message"}}""";
+    }
+
+    private static string RequestUserInput(string callId, string timestamp)
+    {
+        return $$$"""{"timestamp":"{{{timestamp}}}","type":"response_item","payload":{"type":"function_call","name":"request_user_input","call_id":"{{{callId}}}","arguments":"{}"}}""";
+    }
+
+    private static string FunctionCallOutput(string callId, string timestamp)
+    {
+        return $$$"""{"timestamp":"{{{timestamp}}}","type":"response_item","payload":{"type":"function_call_output","call_id":"{{{callId}}}","output":"{}"}}""";
     }
 
     public void Dispose()

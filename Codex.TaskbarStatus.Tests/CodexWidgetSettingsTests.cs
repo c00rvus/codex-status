@@ -17,6 +17,7 @@ public sealed class CodexWidgetSettingsTests
         Assert.True(settings.ShowFiveHourUsage);
         Assert.True(settings.ShowWeeklyUsage);
         Assert.True(settings.ShowPulse);
+        Assert.True(settings.ShowAttentionNotifications);
         Assert.False(settings.Compact);
         Assert.False(settings.HideWhenIdle);
         Assert.Equal(CodexWidgetSettings.DefaultSpinnerColor, settings.SpinnerColor);
@@ -36,6 +37,7 @@ public sealed class CodexWidgetSettingsTests
         Assert.True(settings.ShowFiveHourUsage);
         Assert.True(settings.ShowWeeklyUsage);
         Assert.False(settings.ShowPulse);
+        Assert.True(settings.ShowAttentionNotifications);
         Assert.True(settings.Compact);
         Assert.True(settings.HideWhenIdle);
         Assert.Equal(CodexWidgetSettings.DefaultSpinnerColor, settings.SpinnerColor);
@@ -107,6 +109,7 @@ public sealed class CodexWidgetSettingsTests
             ShowFiles = false,
             ShowAgents = false,
             ShowFiveHourUsage = false,
+            ShowAttentionNotifications = false,
             Compact = true,
             SpinnerColor = "#12abef",
         };
@@ -118,6 +121,7 @@ public sealed class CodexWidgetSettingsTests
         Assert.True(document.RootElement.GetProperty("compact").GetBoolean());
         Assert.False(document.RootElement.GetProperty("showFiles").GetBoolean());
         Assert.False(document.RootElement.GetProperty("showFiveHourUsage").GetBoolean());
+        Assert.False(document.RootElement.GetProperty("showAttentionNotifications").GetBoolean());
         Assert.Equal(
             "weeklyUsage",
             document.RootElement.GetProperty("indicatorOrder")[0].GetString());
@@ -128,6 +132,7 @@ public sealed class CodexWidgetSettingsTests
         Assert.False(restored.ShowFiles);
         Assert.False(restored.ShowAgents);
         Assert.False(restored.ShowFiveHourUsage);
+        Assert.False(restored.ShowAttentionNotifications);
         Assert.Equal(original.IndicatorOrder, restored.IndicatorOrder);
     }
 

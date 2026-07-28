@@ -13,10 +13,11 @@ internal sealed class FlyoutWindow : IDisposable
     private readonly nint _windowHandle;
     private readonly nint _previewWindowHandle;
     private readonly int _logicalWidth;
-    private readonly int _logicalHeight;
+    private int _logicalHeight;
     private readonly OutsideClickMonitor _outsideClickMonitor;
     private readonly Action<bool> _visibilityChanged;
     private NativeMethods.Rect _previewBounds;
+    private uint _previewDpi = 96;
 
     internal FlyoutWindow(
         UIElement pluginContent,
@@ -33,10 +34,9 @@ internal sealed class FlyoutWindow : IDisposable
 
         var card = new Border
         {
-            Background = new SolidColorBrush(Windows.UI.Color.FromArgb(218, 24, 27, 31)),
-            BorderBrush = new SolidColorBrush(Windows.UI.Color.FromArgb(72, 255, 255, 255)),
-            BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(12),
+            Background = new SolidColorBrush(Windows.UI.Color.FromArgb(222, 18, 21, 26)),
+            BorderThickness = new Thickness(0),
+            CornerRadius = new CornerRadius(14),
             Child = pluginContent,
         };
         var root = new Grid
@@ -120,21 +120,11 @@ internal sealed class FlyoutWindow : IDisposable
     internal void Show(NativeMethods.Rect previewBounds, uint previewDpi)
     {
         _previewBounds = previewBounds;
-        var width = (int)Math.Ceiling(_logicalWidth * previewDpi / 96d);
-        var height = (int)Math.Ceiling(_logicalHeight * previewDpi / 96d);
-        var workArea = NativeMethods.GetMonitorWorkArea(previewBounds);
-        var maximumX = Math.Max(workArea.Left, workArea.Right - width);
-        var maximumY = Math.Max(workArea.Top, workArea.Bottom - height);
-        var x = Math.Clamp(previewBounds.Left, workArea.Left, maximumX);
-        var spaceAbove = previewBounds.Top - workArea.Top;
-        var requestedY = spaceAbove >= height + 8
-            ? previewBounds.Top - height - 8
-            : previewBounds.Bottom + 8;
-        var y = Math.Clamp(requestedY, workArea.Top, maximumY);
-        var appWindow = NativeMethods.GetAppWindow(_window);
-        appWindow.Resize(new SizeInt32(width, height));
-        appWindow.Move(new PointInt32(x, y));
+        _previewDpi = previewDpi == 0 ? 96u : previewDpi;
+        // Render first: the widget measures its current content and can update
+        // the logical height before the hidden window is positioned.
         _visibilityChanged(true);
+        var placement = ResizeAndPosition();
         _window.Activate();
         NativeMethods.SetForegroundWindow(_windowHandle);
         try
@@ -147,7 +137,26 @@ internal sealed class FlyoutWindow : IDisposable
             // policy or another process prevents installing the mouse hook.
             StandaloneLog.Write("Outside-click monitor startup failed", exception);
         }
-        StandaloneLog.Write($"Details flyout shown at {x},{y} {width}x{height}.");
+        StandaloneLog.Write(
+            $"Details flyout shown at {placement.X},{placement.Y} " +
+            $"{placement.Width}x{placement.Height}.");
+    }
+
+    internal void UpdateLogicalHeight(int logicalHeight)
+    {
+        var normalized = Math.Clamp(logicalHeight, 300, 620);
+        if (_logicalHeight == normalized)
+        {
+            return;
+        }
+
+        _logicalHeight = normalized;
+        if (IsVisible)
+        {
+            var placement = ResizeAndPosition();
+            StandaloneLog.Write(
+                $"Details flyout resized to {placement.Width}x{placement.Height}.");
+        }
     }
 
     internal void Hide()
@@ -199,6 +208,27 @@ internal sealed class FlyoutWindow : IDisposable
         NativeMethods.GetWindowRect(_previewWindowHandle, out var currentBounds)
             ? currentBounds.Contains(cursor)
             : _previewBounds.Contains(cursor);
+
+    private (int X, int Y, int Width, int Height) ResizeAndPosition()
+    {
+        var workArea = NativeMethods.GetMonitorWorkArea(_previewBounds);
+        var width = (int)Math.Ceiling(_logicalWidth * _previewDpi / 96d);
+        var requestedHeight = (int)Math.Ceiling(_logicalHeight * _previewDpi / 96d);
+        var maximumPhysicalHeight = Math.Max(240, workArea.Bottom - workArea.Top - 16);
+        var height = Math.Min(requestedHeight, maximumPhysicalHeight);
+        var maximumX = Math.Max(workArea.Left, workArea.Right - width);
+        var maximumY = Math.Max(workArea.Top, workArea.Bottom - height);
+        var x = Math.Clamp(_previewBounds.Left, workArea.Left, maximumX);
+        var spaceAbove = _previewBounds.Top - workArea.Top;
+        var requestedY = spaceAbove >= height + 8
+            ? _previewBounds.Top - height - 8
+            : _previewBounds.Bottom + 8;
+        var y = Math.Clamp(requestedY, workArea.Top, maximumY);
+        var appWindow = NativeMethods.GetAppWindow(_window);
+        appWindow.Resize(new SizeInt32(width, height));
+        appWindow.Move(new PointInt32(x, y));
+        return (x, y, width, height);
+    }
 
     private void OnWindowActivated(object sender, WindowActivatedEventArgs args)
     {

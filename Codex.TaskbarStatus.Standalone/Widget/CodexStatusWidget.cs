@@ -13,6 +13,9 @@ namespace Codex.TaskbarStatus.Standalone.Widget;
 
 internal sealed class CodexStatusWidget : IAsyncDisposable
 {
+    private const int MinimumFlyoutHeight = 300;
+    private const int MaximumFlyoutHeight = 620;
+
     private static readonly (string Name, string Hex)[] SpinnerColorPresets =
     [
         ("Blue", "#3B9EFF"),
@@ -24,9 +27,13 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
 
     private readonly CodexStatusReader _statusReader = new();
     private readonly CodexRateLimitService _rateLimitService = new();
+    private readonly ReviewedTaskStore _reviewedTaskStore = new();
     private readonly RequestSpinnerAnimator _spinnerAnimator = new();
     private readonly Dictionary<string, RequestSpinnerAnimator> _flyoutSpinnerAnimators = new();
     private readonly Dictionary<string, TextBlock> _flyoutSpinnerTexts = new();
+    private readonly Dictionary<string, TextBlock> _flyoutTimeTexts = new();
+    private readonly HashSet<string> _reviewedTaskKeys = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _notifiedAttentionStates = new(StringComparer.Ordinal);
     private CodexWidgetSettings _settings = new();
     private CodexStatusBoardSnapshot _board = new();
     private CodexStatusSnapshot _snapshot = new();
@@ -43,19 +50,28 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
     private PreviewVisualState? _lastPreviewVisualState;
     private FlyoutVisualState? _lastFlyoutVisualState;
     private int _previewLogicalWidth = 400;
+    private int _flyoutLogicalHeight = MinimumFlyoutHeight;
     private IWidgetRuntimeContext? _context;
 
     internal int PreviewLogicalWidth => _previewLogicalWidth;
-    internal bool IsPreviewVisible => !_settings.HideWhenIdle || IsActive(_snapshot.Status);
+    internal bool IsPreviewVisible =>
+        !_settings.HideWhenIdle ||
+        _snapshot.IsActive ||
+        _snapshot.RequiresAttention;
     internal int FlyoutWidth => 500;
-    internal int FlyoutHeight => 430;
+    internal int FlyoutHeight => _flyoutLogicalHeight;
 
     internal Task InitializeAsync(IWidgetRuntimeContext context)
     {
         _context = context;
         _settings = CodexWidgetSettings.FromJson(context.SettingsJson);
-        _board = _statusReader.ReadBoard();
+        _reviewedTaskKeys.UnionWith(_reviewedTaskStore.Read());
+        _board = _statusReader.ReadBoard(_reviewedTaskKeys);
         _snapshot = _board.Primary;
+        _notifiedAttentionStates.UnionWith(
+            _board.Tasks
+                .Where(task => task.ShouldNotifyAttention)
+                .Select(AttentionStateKey));
         _rateLimits = _rateLimitService.Current;
         _rateLimitService.RequestRefresh();
         return Task.CompletedTask;
@@ -90,8 +106,8 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
         _lastFlyoutVisualState = null;
         _flyoutRoot = new StackPanel
         {
-            Spacing = 16,
-            Padding = new Thickness(18),
+            Spacing = 12,
+            Padding = new Thickness(18, 16, 18, 14),
         };
 
         EnsureTimers();
@@ -146,6 +162,13 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
         var behaviorOptions = new StackPanel { Spacing = 6 };
         AddToggle(behaviorOptions, "Animated spinner", draft.ShowPulse, value => draft.ShowPulse = value, draft, context);
         AddSpinnerColorSelector(behaviorOptions, draft, context);
+        AddToggle(
+            behaviorOptions,
+            "Attention notifications",
+            draft.ShowAttentionNotifications,
+            value => draft.ShowAttentionNotifications = value,
+            draft,
+            context);
         AddToggle(behaviorOptions, "Compact mode", draft.Compact, value => draft.Compact = value, draft, context);
         AddToggle(behaviorOptions, "Hide when idle", draft.HideWhenIdle, value => draft.HideWhenIdle = value, draft, context);
 
@@ -196,6 +219,7 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
         _flyoutVisible = isVisible;
         if (!isVisible)
         {
+            SyncSpinnerTimer();
             return;
         }
 
@@ -203,7 +227,7 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
         // painted frame never shows data left over from the previous opening.
         try
         {
-            RefreshVisualState(forceFlyout: true);
+            RefreshVisualState();
         }
         catch (Exception exception)
         {
@@ -226,8 +250,12 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
         _flyoutScrollViewer = null;
         _flyoutSpinnerTexts.Clear();
         _flyoutSpinnerAnimators.Clear();
+        _flyoutTimeTexts.Clear();
+        _reviewedTaskKeys.Clear();
+        _notifiedAttentionStates.Clear();
         _lastPreviewVisualState = null;
         _lastFlyoutVisualState = null;
+        _flyoutLogicalHeight = MinimumFlyoutHeight;
         _statusReader.Dispose();
         await _rateLimitService.DisposeAsync();
     }
@@ -250,14 +278,15 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
         SyncSpinnerTimer();
     }
 
-    private void RefreshVisualState(bool forceFlyout = false)
+    private void RefreshVisualState()
     {
         var priorVisibility = IsPreviewVisible;
         var priorWidth = PreviewLogicalWidth;
         var now = DateTimeOffset.UtcNow;
 
-        _board = _statusReader.ReadBoard();
+        _board = _statusReader.ReadBoard(_reviewedTaskKeys);
         _snapshot = _board.Primary;
+        NotifyAttentionTransitions();
         _rateLimitService.RequestRefresh();
         _rateLimits = _rateLimitService.Current;
 
@@ -265,7 +294,7 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
         SyncSpinnerTimer();
         if (_flyoutVisible)
         {
-            RenderFlyout(forceFlyout, now);
+            RenderFlyout(now);
         }
 
         if (priorVisibility != IsPreviewVisible || priorWidth != PreviewLogicalWidth)
@@ -291,7 +320,7 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
 
         var presentation = PreviewPresentationFactory.Create(
             _settings,
-            IsActive(_snapshot.Status),
+            _snapshot.Status == CodexExecutionStatuses.Running,
             _snapshot.FilesChangedCount,
             _snapshot.TotalSubagents);
 
@@ -326,7 +355,7 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
                     PreviewIndicatorKind.Activity => CreateActivitySegment(
                         item,
                         presentation,
-                        visualState.Activity),
+                        visualState),
                     PreviewIndicatorKind.Files => CreateText(
                         item.Text ?? string.Empty,
                         presentation.FilesMaxWidth,
@@ -370,34 +399,53 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
         return true;
     }
 
-    private bool RenderFlyout(bool force, DateTimeOffset now)
+    private bool RenderFlyout(DateTimeOffset now)
     {
         if (_flyoutRoot is null)
         {
             return false;
         }
 
-        var visualState = CreateFlyoutVisualState(now);
-        if (!force && _lastFlyoutVisualState is { } previous && previous == visualState)
+        var visualState = CreateFlyoutVisualState();
+        if (_lastFlyoutVisualState is { } previous && previous == visualState)
         {
+            UpdateFlyoutTaskTimes(now);
             return false;
         }
 
         var previousOffset = _flyoutScrollViewer?.VerticalOffset ?? 0;
         _flyoutRoot.Children.Clear();
         _flyoutSpinnerTexts.Clear();
+        _flyoutTimeTexts.Clear();
 
         _flyoutRoot.Children.Add(CreateFlyoutHeader(visualState));
         _flyoutRoot.Children.Add(CreateRateLimitPanel(visualState));
 
-        var activeTasks = _board.Tasks.Where(task => task.IsActive).ToArray();
-        var completedTasks = _board.Tasks.Where(task => !task.IsActive).ToArray();
-        var activeKeys = activeTasks.Select(task => task.TaskKey).ToHashSet(StringComparer.Ordinal);
+        var attentionTasks = _board.Tasks.Where(task => task.RequiresAttention).ToArray();
+        var activeTasks = _board.Tasks
+            .Where(task => task.IsActive && !task.RequiresAttention)
+            .ToArray();
+        var completedTasks = _board.Tasks
+            .Where(task => !task.IsActive && !task.RequiresAttention)
+            .ToArray();
+        var activeKeys = _board.Tasks
+            .Where(task => task.Status == CodexExecutionStatuses.Running)
+            .Select(task => task.TaskKey)
+            .ToHashSet(StringComparer.Ordinal);
         foreach (var staleKey in _flyoutSpinnerAnimators.Keys
                      .Where(key => !activeKeys.Contains(key))
                      .ToArray())
         {
             _flyoutSpinnerAnimators.Remove(staleKey);
+        }
+
+        if (attentionTasks.Length > 0)
+        {
+            _flyoutRoot.Children.Add(CreateSectionHeader("NEEDS ATTENTION", attentionTasks.Length));
+            foreach (var task in attentionTasks)
+            {
+                _flyoutRoot.Children.Add(CreateTaskCard(task, now));
+            }
         }
 
         if (activeTasks.Length > 0)
@@ -424,6 +472,7 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
         }
 
         _lastFlyoutVisualState = visualState;
+        UpdateDesiredFlyoutHeight();
         if (previousOffset > 0 && _flyoutScrollViewer is { } scrollViewer)
         {
             scrollViewer.DispatcherQueue.TryEnqueue(() =>
@@ -433,10 +482,37 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
         return true;
     }
 
+    private void UpdateDesiredFlyoutHeight()
+    {
+        if (_flyoutRoot is null)
+        {
+            return;
+        }
+
+        _flyoutRoot.Measure(new Windows.Foundation.Size(
+            FlyoutWidth,
+            double.PositiveInfinity));
+        var measuredHeight = (int)Math.Ceiling(_flyoutRoot.DesiredSize.Height);
+        var desiredHeight = Math.Clamp(
+            measuredHeight,
+            MinimumFlyoutHeight,
+            MaximumFlyoutHeight);
+        if (_flyoutLogicalHeight == desiredHeight)
+        {
+            return;
+        }
+
+        _flyoutLogicalHeight = desiredHeight;
+        if (_flyoutVisible)
+        {
+            _context?.RequestFlyoutResize(desiredHeight);
+        }
+    }
+
     private PreviewVisualState CreatePreviewVisualState(DateTimeOffset now)
     {
-        var isActive = IsActive(_snapshot.Status);
-        var showSpinner = isActive && _settings.ShowPulse;
+        var isProcessing = _snapshot.Status == CodexExecutionStatuses.Running;
+        var showSpinner = isProcessing && _settings.ShowPulse;
         var activity = _settings.Compact
             ? CompactActivityLabel.Resolve(
                 _snapshot.Status,
@@ -450,7 +526,6 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
         return new PreviewVisualState(
             _settingsVersion,
             showSpinner,
-            _settings.ShowActivity && _snapshot.Status == "running",
             _settings.ShowActivity ? activity : null,
             showSpinner ? _snapshot.SessionId : null,
             showSpinner ? _snapshot.TurnId : null,
@@ -459,10 +534,12 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
             _settings.ShowAgents ? _snapshot.TotalSubagents : null,
             _settings.ShowElapsed ? FormatElapsed(_snapshot.Elapsed(now)) : null,
             _settings.ShowFiveHourUsage ? _rateLimits.FiveHour : null,
-            _settings.ShowWeeklyUsage ? _rateLimits.Weekly : null);
+            _settings.ShowWeeklyUsage ? _rateLimits.Weekly : null,
+            _board.ActiveCount,
+            _board.AttentionCount);
     }
 
-    private FlyoutVisualState CreateFlyoutVisualState(DateTimeOffset now)
+    private FlyoutVisualState CreateFlyoutVisualState()
     {
         var tasksKey = string.Join(
             '\u001f',
@@ -475,13 +552,21 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
                 task.Cwd,
                 task.FilesChangedCount,
                 task.TotalSubagents,
-                FormatElapsed(task.Elapsed(now)),
-                task.LastUpdatedAtUtc.UtcTicks)));
+                task.CurrentTool,
+                task.ErrorMessage,
+                task.StartedAtUtc?.UtcTicks,
+                task.WaitingSinceAtUtc?.UtcTicks,
+                task.StoppedAtUtc?.UtcTicks,
+                !task.IsActive && task.StoppedAtUtc is null
+                    ? task.LastUpdatedAtUtc.UtcTicks
+                    : 0)));
 
         return new FlyoutVisualState(
             _settingsVersion,
             _board.ActiveCount,
+            _board.RunningCount,
             _board.ReadyCount,
+            _board.AttentionCount,
             tasksKey,
             _rateLimits.FiveHour,
             _rateLimits.Weekly,
@@ -491,7 +576,6 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
     private readonly record struct PreviewVisualState(
         int SettingsVersion,
         bool ShowSpinner,
-        bool ActivityUsesRunningColor,
         string? Activity,
         string? SessionId,
         string? TurnId,
@@ -500,12 +584,16 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
         int? TotalSubagents,
         string? ElapsedText,
         RateLimitWindowState? FiveHour,
-        RateLimitWindowState? Weekly);
+        RateLimitWindowState? Weekly,
+        int ActiveCount,
+        int AttentionCount);
 
     private readonly record struct FlyoutVisualState(
         int SettingsVersion,
         int ActiveCount,
+        int RunningCount,
         int ReadyCount,
+        int AttentionCount,
         string TasksKey,
         RateLimitWindowState FiveHour,
         RateLimitWindowState Weekly,
@@ -513,22 +601,20 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
 
     private static UIElement CreateFlyoutHeader(FlyoutVisualState state)
     {
-        var header = new Grid { ColumnSpacing = 12, Margin = new Thickness(2, 0, 42, 0) };
+        var header = new Grid
+        {
+            ColumnSpacing = 12,
+            Margin = new Thickness(2, 0, 42, 2),
+        };
         header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
-        var icon = new Border
+        var icon = new Image
         {
-            Width = 28,
-            Height = 28,
-            CornerRadius = new CornerRadius(9),
-            Child = new Image
-            {
-                Source = new BitmapImage(new Uri("ms-appx:///Assets/CodexStatus.png")),
-                Width = 28,
-                Height = 28,
-            },
+            Source = new BitmapImage(new Uri("ms-appx:///Assets/CodexStatus.png")),
+            Width = 30,
+            Height = 30,
             VerticalAlignment = VerticalAlignment.Center,
         };
         header.Children.Add(icon);
@@ -539,62 +625,108 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
             Text = "Codex Status",
             FontSize = 20,
             FontWeight = FontWeights.SemiBold,
+            FontFamily = new FontFamily("Segoe UI Variable Display"),
         });
         heading.Children.Add(new TextBlock
         {
-            Text = state.ActiveCount switch
-            {
-                > 0 when state.ReadyCount > 0 =>
-                    $"{FormatCount(state.ActiveCount, "active task", "active tasks")} · " +
-                    $"{FormatCount(state.ReadyCount, "ready", "ready")}",
-                > 0 => FormatCount(state.ActiveCount, "active task", "active tasks"),
-                _ when state.ReadyCount > 0 => FormatCount(state.ReadyCount, "task ready", "tasks ready"),
-                _ => "All caught up",
-            },
+            Text = FormatFlyoutHeaderSummary(state),
             FontSize = 11.5,
             Foreground = Brush("#FFAAB2BC"),
         });
         Grid.SetColumn(heading, 1);
         header.Children.Add(heading);
 
-        var badgeText = state.ActiveCount > 0 ? $"{state.ActiveCount} active" : "Idle";
-        var badge = new Border
+        var statusColor = state.AttentionCount > 0
+            ? Brush("#FFFFC766")
+            : state.ActiveCount > 0
+                ? Brush("#FF65B8FF")
+                : Brush("#FF8F99A4");
+        var status = new StackPanel
         {
-            Padding = new Thickness(9, 4, 9, 4),
-            CornerRadius = new CornerRadius(10),
-            Background = Brush(state.ActiveCount > 0 ? "#293B9EFF" : "#1E8A949F"),
-            BorderBrush = Brush(state.ActiveCount > 0 ? "#703B9EFF" : "#358A949F"),
-            BorderThickness = new Thickness(1),
-            Child = new TextBlock
-            {
-                Text = badgeText,
-                FontSize = 10.5,
-                Foreground = Brush(state.ActiveCount > 0 ? "#FF8CCAFF" : "#FFB2BAC3"),
-            },
+            Orientation = Orientation.Horizontal,
+            Spacing = 6,
             VerticalAlignment = VerticalAlignment.Center,
         };
-        Grid.SetColumn(badge, 2);
-        header.Children.Add(badge);
+        status.Children.Add(new Border
+        {
+            Width = 6,
+            Height = 6,
+            CornerRadius = new CornerRadius(3),
+            Background = statusColor,
+        });
+        status.Children.Add(new TextBlock
+        {
+            Text = state.AttentionCount > 0
+                ? $"{state.AttentionCount} ATTENTION"
+                : state.ActiveCount > 0
+                    ? $"{state.ActiveCount} ACTIVE"
+                    : "IDLE",
+            FontSize = 10,
+            CharacterSpacing = 45,
+            FontWeight = FontWeights.SemiBold,
+            Foreground = statusColor,
+            VerticalAlignment = VerticalAlignment.Center,
+        });
+        Grid.SetColumn(status, 2);
+        header.Children.Add(status);
         return header;
+    }
+
+    private static string FormatFlyoutHeaderSummary(FlyoutVisualState state)
+    {
+        if (state.AttentionCount > 0)
+        {
+            var summary = FormatCount(
+                state.AttentionCount,
+                "task needs attention",
+                "tasks need attention");
+            return state.RunningCount > 0
+                ? $"{summary} · {FormatCount(state.RunningCount, "running", "running")}"
+                : summary;
+        }
+
+        return state.ActiveCount switch
+        {
+            > 0 when state.ReadyCount > 0 =>
+                $"{FormatCount(state.ActiveCount, "active task", "active tasks")} · " +
+                $"{FormatCount(state.ReadyCount, "ready", "ready")}",
+            > 0 => FormatCount(state.ActiveCount, "active task", "active tasks"),
+            _ when state.ReadyCount > 0 =>
+                FormatCount(state.ReadyCount, "task ready", "tasks ready"),
+            _ => "All caught up",
+        };
     }
 
     private static UIElement CreateRateLimitPanel(FlyoutVisualState state)
     {
-        var grid = new Grid { ColumnSpacing = 18 };
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        grid.Children.Add(CreateRateLimitSummary("5-HOUR", state.FiveHour, 0));
-        grid.Children.Add(CreateRateLimitSummary("WEEKLY", state.Weekly, 1));
-
-        return new Border
+        var grid = new Grid
         {
-            Background = Brush("#4223282E"),
-            BorderBrush = Brush("#4A5A626C"),
-            BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(12),
-            Padding = new Thickness(14, 11, 14, 12),
-            Child = grid,
+            ColumnSpacing = 18,
+            Margin = new Thickness(2, 5, 2, 3),
         };
+        grid.ColumnDefinitions.Add(new ColumnDefinition
+        {
+            Width = new GridLength(1, GridUnitType.Star),
+        });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1) });
+        grid.ColumnDefinitions.Add(new ColumnDefinition
+        {
+            Width = new GridLength(1, GridUnitType.Star),
+        });
+        grid.Children.Add(CreateRateLimitSummary("5-HOUR", state.FiveHour, 0));
+        var separator = new Border
+        {
+            Width = 1,
+            Background = Brush("#285F6974"),
+            Margin = new Thickness(0, 1, 0, 1),
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Stretch,
+        };
+        Grid.SetColumn(separator, 1);
+        grid.Children.Add(separator);
+        var weekly = CreateRateLimitSummary("WEEKLY", state.Weekly, 2);
+        grid.Children.Add(weekly);
+        return grid;
     }
 
     private static UIElement CreateRateLimitSummary(
@@ -676,24 +808,41 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
 
     private static UIElement CreateSectionHeader(string label, int count)
     {
-        var row = new Grid { Margin = new Thickness(2, 2, 2, -5) };
-        row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        var row = new Grid
+        {
+            ColumnSpacing = 10,
+            Margin = new Thickness(2, 5, 2, -3),
+        };
         row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        row.Children.Add(new TextBlock
+        row.ColumnDefinitions.Add(new ColumnDefinition
+        {
+            Width = new GridLength(1, GridUnitType.Star),
+        });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        var labelText = new TextBlock
         {
             Text = label,
-            FontSize = 10.5,
-            CharacterSpacing = 90,
+            FontSize = 10,
+            CharacterSpacing = 105,
             FontWeight = FontWeights.SemiBold,
             Foreground = Brush("#FF9DA6B0"),
-        });
+        };
+        row.Children.Add(labelText);
+        var rule = new Border
+        {
+            Height = 1,
+            Background = Brush("#245F6974"),
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        Grid.SetColumn(rule, 1);
+        row.Children.Add(rule);
         var countText = new TextBlock
         {
             Text = count.ToString(),
-            FontSize = 10.5,
+            FontSize = 10,
             Foreground = Brush("#FF7F8994"),
         };
-        Grid.SetColumn(countText, 1);
+        Grid.SetColumn(countText, 2);
         row.Children.Add(countText);
         return row;
     }
@@ -701,7 +850,7 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
     private UIElement CreateTaskCard(CodexStatusSnapshot task, DateTimeOffset now)
     {
         var statusColor = TaskStatusColor(task);
-        var content = new StackPanel { Spacing = 8 };
+        var content = new StackPanel { Spacing = 6 };
 
         var top = new Grid { ColumnSpacing = 12 };
         top.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -737,6 +886,7 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
         };
         Grid.SetColumn(elapsed, 1);
         top.Children.Add(elapsed);
+        _flyoutTimeTexts[task.TaskKey] = elapsed;
         content.Children.Add(top);
 
         var footer = new Grid { ColumnSpacing = 10 };
@@ -748,12 +898,17 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
             Spacing = 7,
             VerticalAlignment = VerticalAlignment.Center,
         };
-        activity.Children.Add(task.IsActive && _settings.ShowPulse
+        activity.Children.Add(
+            task.Status == CodexExecutionStatuses.Running && _settings.ShowPulse
             ? CreateFlyoutTaskSpinner(task)
             : CreateTaskStateGlyph(task, statusColor));
         activity.Children.Add(new TextBlock
         {
-            Text = task.IsActive ? task.Activity : "Completed",
+            Text = task.RequiresAttention
+                ? task.Activity
+                : task.IsActive
+                    ? task.Activity
+                    : "Completed",
             FontSize = 11.5,
             Foreground = new SolidColorBrush(statusColor),
             TextTrimming = TextTrimming.CharacterEllipsis,
@@ -765,43 +920,214 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
         var chips = new StackPanel
         {
             Orientation = Orientation.Horizontal,
-            Spacing = 5,
+            Spacing = 8,
             VerticalAlignment = VerticalAlignment.Center,
         };
-        chips.Children.Add(CreateTaskChip(FormatCount(task.FilesChangedCount, "file", "files")));
-        chips.Children.Add(CreateTaskChip(FormatCount(task.TotalSubagents, "subagent", "subagents")));
+        chips.Children.Add(new TextBlock
+        {
+            Text =
+                $"{FormatCount(task.FilesChangedCount, "file", "files")}  ·  " +
+                $"{FormatCount(task.TotalSubagents, "subagent", "subagents")}",
+            FontSize = 9.5,
+            Foreground = Brush("#FF8E98A3"),
+            VerticalAlignment = VerticalAlignment.Center,
+        });
         Grid.SetColumn(chips, 1);
         footer.Children.Add(chips);
         content.Children.Add(footer);
 
-        var layout = new Grid { ColumnSpacing = 11 };
-        layout.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(3) });
+        if (task.RequiresAttention)
+        {
+            var attentionDetail = !string.IsNullOrWhiteSpace(task.ErrorMessage)
+                ? task.ErrorMessage
+                : task.Status == CodexExecutionStatuses.Waiting
+                    ? "Action required in Codex"
+                    : task.Activity;
+            content.Children.Add(new TextBlock
+            {
+                Text = attentionDetail,
+                FontSize = 10.5,
+                MaxLines = 2,
+                TextWrapping = TextWrapping.Wrap,
+                TextTrimming = TextTrimming.CharacterEllipsis,
+                Foreground = new SolidColorBrush(statusColor),
+                Opacity = 0.82,
+                Margin = new Thickness(0, 1, 0, 0),
+            });
+        }
+
+        if (!task.IsActive)
+        {
+            var actions = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                Spacing = 7,
+                HorizontalAlignment = HorizontalAlignment.Right,
+            };
+            actions.Children.Add(CreateTaskActionButton(
+                "Open",
+                "\uE8A7",
+                () => OpenTask(task),
+                enabled: !string.IsNullOrWhiteSpace(task.SessionId)));
+            actions.Children.Add(CreateTaskActionButton(
+                "Mark reviewed",
+                "\uE73E",
+                () => MarkTaskReviewed(task)));
+            content.Children.Add(actions);
+        }
+
+        var layout = new Grid { ColumnSpacing = 10 };
+        layout.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(2) });
         layout.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         layout.Children.Add(new Border
         {
-            Width = 3,
-            CornerRadius = new CornerRadius(2),
+            Width = 2,
+            CornerRadius = new CornerRadius(1),
             Background = new SolidColorBrush(statusColor),
             VerticalAlignment = VerticalAlignment.Stretch,
+            Opacity = 0.92,
         });
         Grid.SetColumn(content, 1);
         layout.Children.Add(content);
 
         var card = new Border
         {
-            Background = Brush(task.IsActive ? "#4A23282E" : "#38242A2F"),
-            BorderBrush = Brush(task.IsActive ? "#4F626B76" : "#3A59616B"),
-            BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(12),
-            Padding = new Thickness(11),
+            Background = new SolidColorBrush(Colors.Transparent),
+            BorderThickness = new Thickness(0),
+            CornerRadius = new CornerRadius(8),
+            Padding = new Thickness(7, 9, 7, 10),
             Child = layout,
             Opacity = task.IsActive ? 1 : 0.9,
         };
+        card.PointerEntered += (_, _) => card.Background = Brush("#182F3944");
+        card.PointerExited += (_, _) =>
+            card.Background = new SolidColorBrush(Colors.Transparent);
         AutomationProperties.SetName(
             card,
             $"{TaskDisplayTitle(task)}, {task.Activity}, {FormatElapsed(task.Elapsed(now))}");
+        if (!string.IsNullOrWhiteSpace(task.SessionId))
+        {
+            AutomationProperties.SetHelpText(card, "Click to open this task in Codex");
+            ToolTipService.SetToolTip(card, "Open in Codex");
+            card.Tapped += (_, args) =>
+            {
+                args.Handled = true;
+                OpenTask(task);
+            };
+        }
+
         return card;
     }
+
+    private static Button CreateTaskActionButton(
+        string label,
+        string glyph,
+        Action action,
+        bool enabled = true)
+    {
+        var content = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 5,
+        };
+        content.Children.Add(new FontIcon { Glyph = glyph, FontSize = 11 });
+        content.Children.Add(new TextBlock { Text = label, FontSize = 10.5 });
+
+        var button = new Button
+        {
+            Content = content,
+            Padding = new Thickness(7, 3, 7, 3),
+            MinHeight = 26,
+            IsEnabled = enabled,
+            Background = new SolidColorBrush(Colors.Transparent),
+            BorderThickness = new Thickness(0),
+            CornerRadius = new CornerRadius(4),
+            Foreground = Brush(label == "Open" ? "#FF68B8FF" : "#FF9CA6B1"),
+        };
+        button.Tapped += (_, args) => args.Handled = true;
+        button.Click += (_, _) => action();
+        AutomationProperties.SetName(button, label);
+        return button;
+    }
+
+    private void OpenTask(CodexStatusSnapshot task)
+    {
+        if (!string.IsNullOrWhiteSpace(task.SessionId))
+        {
+            _context?.RequestOpenTask(task.SessionId);
+        }
+    }
+
+    private void MarkTaskReviewed(CodexStatusSnapshot task)
+    {
+        try
+        {
+            _reviewedTaskStore.MarkReviewed(task.TaskKey);
+            _reviewedTaskKeys.Add(task.TaskKey);
+            _flyoutRoot?.DispatcherQueue.TryEnqueue(() =>
+                RefreshVisualState());
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException)
+        {
+            StandaloneLog.Write("Saving the reviewed task failed", exception);
+        }
+    }
+
+    private void UpdateFlyoutTaskTimes(DateTimeOffset now)
+    {
+        foreach (var task in _board.Tasks)
+        {
+            if (!_flyoutTimeTexts.TryGetValue(task.TaskKey, out var text))
+            {
+                continue;
+            }
+
+            var value = task.IsActive
+                ? FormatElapsed(task.Elapsed(now))
+                : FormatUpdatedAt(task.StoppedAtUtc ?? task.LastUpdatedAtUtc);
+            if (!string.Equals(text.Text, value, StringComparison.Ordinal))
+            {
+                text.Text = value;
+            }
+        }
+    }
+
+    private void NotifyAttentionTransitions()
+    {
+        var currentStates = _board.Tasks
+            .Where(task => task.ShouldNotifyAttention)
+            .ToDictionary(AttentionStateKey, StringComparer.Ordinal);
+
+        if (_settings.ShowAttentionNotifications)
+        {
+            var now = DateTimeOffset.UtcNow;
+            foreach (var (stateKey, task) in currentStates)
+            {
+                if (_notifiedAttentionStates.Contains(stateKey) ||
+                    task.LastUpdatedAtUtc == DateTimeOffset.MinValue ||
+                    now - task.LastUpdatedAtUtc > TimeSpan.FromMinutes(10))
+                {
+                    continue;
+                }
+
+                _context?.RequestAttentionNotification(new WidgetAttentionNotification(
+                    task.TaskKey,
+                    task.SessionId,
+                    TaskDisplayTitle(task),
+                    !string.IsNullOrWhiteSpace(task.ErrorMessage)
+                        ? task.ErrorMessage
+                        : task.Activity,
+                    task.Status == CodexExecutionStatuses.Error));
+            }
+        }
+
+        _notifiedAttentionStates.Clear();
+        _notifiedAttentionStates.UnionWith(currentStates.Keys);
+    }
+
+    private static string AttentionStateKey(CodexStatusSnapshot task) =>
+        $"{task.TaskKey}\u001f{task.Status}\u001f{task.Activity}";
 
     private Border CreateFlyoutTaskSpinner(CodexStatusSnapshot task)
     {
@@ -839,6 +1165,18 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
         CodexStatusSnapshot task,
         Windows.UI.Color color)
     {
+        if (task.RequiresAttention)
+        {
+            return new FontIcon
+            {
+                Glyph = task.Status == CodexExecutionStatuses.Error
+                    ? "\uEA39"
+                    : "\uE7BA",
+                FontSize = 12,
+                Foreground = new SolidColorBrush(color),
+            };
+        }
+
         if (!task.IsActive)
         {
             return new FontIcon
@@ -858,25 +1196,13 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
         };
     }
 
-    private static Border CreateTaskChip(string text) => new()
-    {
-        Padding = new Thickness(6, 2, 6, 2),
-        CornerRadius = new CornerRadius(7),
-        Background = Brush("#35454C55"),
-        Child = new TextBlock
-        {
-            Text = text,
-            FontSize = 9.5,
-            Foreground = Brush("#FFAAB2BC"),
-        },
-    };
-
     private static UIElement CreateEmptyTasksCard()
     {
         var panel = new StackPanel
         {
             Spacing = 6,
             HorizontalAlignment = HorizontalAlignment.Center,
+            Margin = new Thickness(12, 18, 12, 10),
         };
         panel.Children.Add(new FontIcon
         {
@@ -900,15 +1226,7 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
             TextWrapping = TextWrapping.Wrap,
         });
 
-        return new Border
-        {
-            Background = Brush("#30242A30"),
-            BorderBrush = Brush("#3A59616B"),
-            BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(12),
-            Padding = new Thickness(18),
-            Child = panel,
-        };
+        return panel;
     }
 
     private static string TaskDisplayTitle(CodexStatusSnapshot task)
@@ -969,7 +1287,7 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
     private StackPanel CreateActivitySegment(
         PreviewIndicatorPresentation item,
         PreviewPresentation presentation,
-        string? activityText)
+        PreviewVisualState visualState)
     {
         var segment = new StackPanel
         {
@@ -987,14 +1305,81 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
             else
             {
                 segment.Children.Add(CreateText(
-                    activityText ?? string.Empty,
+                    visualState.Activity ?? string.Empty,
                     presentation.ActivityMaxWidth,
                     presentation.TextFontSize,
-                    _snapshot.Status == "running" ? Colors.White : Color("#FFD1D6DC")));
+                    _snapshot.Status switch
+                    {
+                        CodexExecutionStatuses.Running => Colors.White,
+                        CodexExecutionStatuses.Waiting => Color("#FFFFD487"),
+                        CodexExecutionStatuses.Error => Color("#FFFF8A8A"),
+                        _ => Color("#FFD1D6DC"),
+                    }));
             }
         }
 
+        if (visualState.ActiveCount > 1 || visualState.AttentionCount > 0)
+        {
+            segment.Children.Add(CreateTaskCountBadge(
+                visualState.ActiveCount,
+                visualState.AttentionCount,
+                _snapshot.Status == CodexExecutionStatuses.Error));
+        }
+
         return segment;
+    }
+
+    private static Border CreateTaskCountBadge(
+        int activeCount,
+        int attentionCount,
+        bool hasError)
+    {
+        var hasMultipleActive = activeCount > 1;
+        var text = hasMultipleActive
+            ? activeCount.ToString()
+            : attentionCount > 1
+                ? $"!{attentionCount}"
+                : "!";
+        var accent = attentionCount > 0
+            ? hasError
+                ? Color("#FFFF7474")
+                : Color("#FFF4BE5B")
+            : Color("#FF5AACFF");
+        var badge = new Border
+        {
+            MinWidth = 18,
+            Height = 18,
+            Padding = new Thickness(5, 0, 5, 0),
+            CornerRadius = new CornerRadius(9),
+            Background = new SolidColorBrush(Windows.UI.Color.FromArgb(
+                48,
+                accent.R,
+                accent.G,
+                accent.B)),
+            BorderBrush = new SolidColorBrush(Windows.UI.Color.FromArgb(
+                125,
+                accent.R,
+                accent.G,
+                accent.B)),
+            BorderThickness = new Thickness(1),
+            Child = new TextBlock
+            {
+                Text = text,
+                FontSize = 10,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = new SolidColorBrush(accent),
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center,
+            },
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+
+        var accessibleName = hasMultipleActive
+            ? $"{activeCount} active tasks"
+            : $"{attentionCount} task{(attentionCount == 1 ? string.Empty : "s")} need attention";
+        AutomationProperties.SetName(badge, accessibleName);
+        ToolTipService.SetToolTip(badge, accessibleName);
+        return badge;
     }
 
     private StackPanel CreateUsageGroup(
@@ -1180,7 +1565,7 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
 
     private AgentSpinnerFrame? CurrentSpinnerFrame(DateTimeOffset nowUtc) =>
         _spinnerAnimator.GetFrame(
-            IsActive(_snapshot.Status),
+            _snapshot.Status == CodexExecutionStatuses.Running,
             _snapshot.SessionId,
             _snapshot.TurnId,
             _snapshot.StartedAtUtc,
@@ -1188,17 +1573,20 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
 
     private void UpdateSpinnerFrame()
     {
-        if (!_settings.ShowPulse || !IsActive(_snapshot.Status))
+        if (!_settings.ShowPulse)
         {
             return;
         }
 
         var now = DateTimeOffset.UtcNow;
-        var frame = CurrentSpinnerFrame(now);
-        if (_spinnerText is not null && frame is not null &&
-            !string.Equals(_spinnerText.Text, frame.Text, StringComparison.Ordinal))
+        if (_snapshot.Status == CodexExecutionStatuses.Running)
         {
-            _spinnerText.Text = frame.Text;
+            var frame = CurrentSpinnerFrame(now);
+            if (_spinnerText is not null && frame is not null &&
+                !string.Equals(_spinnerText.Text, frame.Text, StringComparison.Ordinal))
+            {
+                _spinnerText.Text = frame.Text;
+            }
         }
 
         if (!_flyoutVisible || _flyoutSpinnerTexts.Count == 0)
@@ -1206,7 +1594,8 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
             return;
         }
 
-        foreach (var task in _board.Tasks.Where(task => task.IsActive))
+        foreach (var task in _board.Tasks.Where(
+                     task => task.Status == CodexExecutionStatuses.Running))
         {
             if (!_flyoutSpinnerTexts.TryGetValue(task.TaskKey, out var text) ||
                 !_flyoutSpinnerAnimators.TryGetValue(task.TaskKey, out var animator))
@@ -1230,13 +1619,18 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
 
     private void SyncSpinnerTimer()
     {
-        var isActive = IsActive(_snapshot.Status);
-        if (!isActive)
+        var previewIsRunning = _snapshot.Status == CodexExecutionStatuses.Running;
+        if (!previewIsRunning)
         {
             _spinnerAnimator.Reset();
         }
 
-        var shouldRun = isActive && _settings.ShowPulse && _spinnerTimer is not null;
+        var flyoutHasRunningTask = _flyoutVisible &&
+            _board.Tasks.Any(task => task.Status == CodexExecutionStatuses.Running);
+        var shouldRun =
+            _settings.ShowPulse &&
+            _spinnerTimer is not null &&
+            (previewIsRunning || flyoutHasRunningTask);
         if (shouldRun && !_spinnerTimerRunning)
         {
             _spinnerTimer!.Start();
@@ -1660,9 +2054,6 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
         row.Children.Add(element);
         hasContent = true;
     }
-
-    private static bool IsActive(string? status) =>
-        status is "running" or "waiting";
 
     private static string FormatElapsed(TimeSpan elapsed)
     {

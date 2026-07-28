@@ -10,11 +10,16 @@ public sealed class HookEventProcessor
         RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase | RegexOptions.Multiline);
 
     private readonly StatusFileStore _store;
+    private readonly StatusSessionStore? _sessionStore;
     private readonly TimeProvider _timeProvider;
 
-    public HookEventProcessor(StatusFileStore? store = null, TimeProvider? timeProvider = null)
+    public HookEventProcessor(
+        StatusFileStore? store = null,
+        TimeProvider? timeProvider = null,
+        StatusSessionStore? sessionStore = null)
     {
         _store = store ?? new StatusFileStore();
+        _sessionStore = sessionStore ?? (store is null ? new StatusSessionStore() : null);
         _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
@@ -52,9 +57,22 @@ public sealed class HookEventProcessor
             }
 
             var now = ReadTimestamp(root) ?? _timeProvider.GetUtcNow();
-            return await _store.UpdateAsync(
+            var sessionId = ReadString(root, "session_id", "sessionId");
+            var targetStore = !string.IsNullOrWhiteSpace(sessionId) && _sessionStore is not null
+                ? _sessionStore.GetStore(sessionId)
+                : _store;
+            var updated = await targetStore.UpdateAsync(
                 state => ApplyEvent(state, root, NormalizeName(eventName), now),
                 cancellationToken).ConfigureAwait(false);
+
+            if (!ReferenceEquals(targetStore, _store))
+            {
+                await _store.UpdateAsync(
+                    _ => updated,
+                    cancellationToken).ConfigureAwait(false);
+            }
+
+            return updated;
         }
     }
 

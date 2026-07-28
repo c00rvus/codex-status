@@ -27,6 +27,9 @@ cd codex-status
 ## Features
 
 - Live activity, changed-file, subagent, and elapsed-time indicators.
+- Multi-task counter and a task list with direct links back to Codex.
+- Attention highlighting and optional Windows notifications for tasks that need input.
+- Open or mark completed tasks as reviewed from the details popup.
 - Five-hour and weekly usage indicators.
 - Animated spinners with a configurable color.
 - Configurable visibility and order for every indicator.
