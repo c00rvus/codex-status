@@ -26,7 +26,11 @@ internal interface IWidgetSettingsContext
 {
     string SettingsJson { get; }
 
+    bool StartWithWindows { get; }
+
     void SaveSettings(string settingsJson);
+
+    void SetStartWithWindows(bool enabled);
 
     void RequestPreviewRefresh();
 }

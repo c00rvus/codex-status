@@ -11,6 +11,27 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function Get-RegistryValueOrNull {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string]$Name
+    )
+
+    try {
+        return Get-ItemPropertyValue `
+            -Path $Path `
+            -Name $Name `
+            -ErrorAction Stop
+    } catch [System.Management.Automation.ItemNotFoundException] {
+        return $null
+    } catch [System.Management.Automation.PSArgumentException] {
+        return $null
+    }
+}
+
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $installRoot = Join-Path $env:LOCALAPPDATA 'Programs\Codex Status Source'
 $stagingRoot = Join-Path $root 'artifacts\manual-install'
@@ -19,7 +40,23 @@ $bridgeStaging = Join-Path $stagingRoot 'bridge'
 $bridgeProject = Join-Path $root 'Codex.TaskbarStatus.Bridge\Codex.TaskbarStatus.Bridge.csproj'
 $configureHooks = Join-Path $root 'installer\Configure-CodexHooks.ps1'
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+$startupApprovedKey =
+    'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'
 $runValueName = 'Codex Status Source'
+$existingInstallation = Test-Path -LiteralPath $installRoot -PathType Container
+$existingRunValue = Get-RegistryValueOrNull `
+    -Path $runKey `
+    -Name $runValueName
+$startupApproval = Get-RegistryValueOrNull `
+    -Path $startupApprovedKey `
+    -Name $runValueName
+$startupExplicitlyDisabled =
+    $startupApproval -is [byte[]] -and
+    $startupApproval.Length -gt 0 -and
+    $startupApproval[0] -eq 0x03
+$startupWasEnabled =
+    $null -ne $existingRunValue -and
+    -not $startupExplicitlyDisabled
 
 if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
     throw 'The .NET 8 SDK is required for installation from source.'
@@ -90,12 +127,20 @@ if (-not $SkipHooks) {
 New-Item -Path $runKey -Force | Out-Null
 if ($NoStartup) {
     Remove-ItemProperty -Path $runKey -Name $runValueName -ErrorAction SilentlyContinue
-} else {
+    Remove-ItemProperty `
+        -Path $startupApprovedKey `
+        -Name $runValueName `
+        -ErrorAction SilentlyContinue
+} elseif (-not $existingInstallation -or $startupWasEnabled) {
+    Remove-ItemProperty `
+        -Path $startupApprovedKey `
+        -Name $runValueName `
+        -ErrorAction SilentlyContinue
     New-ItemProperty `
         -Path $runKey `
         -Name $runValueName `
         -PropertyType String `
-        -Value ('"{0}"' -f $appExecutable) `
+        -Value ('"{0}" --startup' -f $appExecutable) `
         -Force | Out-Null
 }
 

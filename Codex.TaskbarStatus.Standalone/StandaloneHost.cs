@@ -10,6 +10,8 @@ namespace Codex.TaskbarStatus.Standalone;
 internal sealed class StandaloneHost
 {
     private readonly StandaloneSettingsStore _settingsStore = new();
+    private readonly WindowsStartupRegistration _startupRegistration =
+        WindowsStartupRegistration.CreateForCurrentProcess();
     private readonly CodexStatusWidget _widget = new();
     private StandaloneSettings _settings = new();
     private StandaloneWidgetContext? _context;
@@ -253,9 +255,11 @@ internal sealed class StandaloneHost
             var originalSettings = _context?.SettingsJson ?? _settings.WidgetSettingsJson;
             var originalStandaloneSettings = CloneSettings(_settings);
             var placementDraft = ToPlacementDraft(_settings);
+            var startWithWindows = _startupRegistration.IsEnabled();
             createdWindow = new SettingsWindow(
                 _widget,
                 originalSettings,
+                startWithWindows,
                 placementDraft,
                 GetMonitorOptions(),
                 draftJson =>
@@ -317,16 +321,57 @@ internal sealed class StandaloneHost
 
     private void SaveSettings(
         string settingsJson,
-        StandalonePlacementDraft placementDraft)
+        StandalonePlacementDraft placementDraft,
+        bool startWithWindows)
     {
         var normalized = CodexWidgetSettings.FromJson(settingsJson).ToJson();
+        var previousStartupState = _startupRegistration.IsEnabled();
+        var startupChanged = previousStartupState != startWithWindows;
         ApplyPlacementDraft(placementDraft);
         _settings.WidgetSettingsJson = normalized;
-        _settingsStore.Save(_settings);
-        _context?.ReplaceSettings(normalized);
-        _widget.OnSettingsDraftChanged(normalized);
-        RefreshPreview();
-        StandaloneLog.Write("Standalone settings saved.");
+        try
+        {
+            if (startupChanged)
+            {
+                _startupRegistration.SetEnabled(startWithWindows);
+            }
+
+            _settingsStore.Save(_settings);
+        }
+        catch
+        {
+            if (startupChanged)
+            {
+                try
+                {
+                    _startupRegistration.SetEnabled(previousStartupState);
+                }
+                catch (Exception rollbackException)
+                {
+                    StandaloneLog.Write(
+                        "Restoring the Windows startup setting failed",
+                        rollbackException);
+                }
+            }
+
+            throw;
+        }
+
+        try
+        {
+            _context?.ReplaceSettings(normalized);
+            _widget.OnSettingsDraftChanged(normalized);
+            RefreshPreview();
+        }
+        catch (Exception exception)
+        {
+            StandaloneLog.Write(
+                "Refreshing the saved settings failed",
+                exception);
+        }
+
+        StandaloneLog.Write(
+            $"Standalone settings saved. StartWithWindows={startWithWindows}.");
     }
 
     private void ApplyPlacementDraft(StandalonePlacementDraft draft)

@@ -26,30 +26,46 @@ public sealed class RolloutStatusReader : IDisposable
         ? StringComparer.OrdinalIgnoreCase
         : StringComparer.Ordinal;
 
-    private static readonly TimeSpan DefaultFallbackRescanInterval = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan DefaultFallbackRescanInterval = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan WatcherUnavailableRescanInterval = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan TransientReadRetryInterval = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan KnownActiveRetention = TimeSpan.FromDays(7);
     private const int ReadBufferSize = 16 * 1024;
     private const int CheckpointSize = 128;
     private const int MaxTaskTitleLength = 120;
+    private const int MaxCachedEntries = 96;
 
     private readonly string _sessionsRoot;
     private readonly TimeSpan _fallbackRescanInterval;
+    private readonly TimeProvider _timeProvider;
     private readonly object _sync = new();
     private readonly Dictionary<string, RolloutCacheEntry> _entries = new(PathComparer);
+    private readonly Dictionary<string, RolloutPathStamp> _indexedPaths = new(PathComparer);
+    private readonly SortedSet<RolloutPathStamp> _orderedPaths =
+        new(RolloutPathStampComparer.Instance);
+    private readonly HashSet<string> _pendingPathChanges = new(PathComparer);
+    private readonly HashSet<string> _contentDirtyPaths = new(PathComparer);
     private FileSystemWatcher? _watcher;
     private string? _selectedPath;
     private DateTimeOffset _nextFallbackRescanAtUtc = DateTimeOffset.MinValue;
-    private bool _rescanRequired = true;
+    private DateTimeOffset _nextDirtyContentRetryAtUtc = DateTimeOffset.MinValue;
+    private DateTimeOffset _nextPathMetadataRetryAtUtc = DateTimeOffset.MinValue;
+    private bool _pathIndexInitialized;
+    private bool _fullRescanRequired = true;
+    private bool _latestSelectionDirty = true;
     private bool _disposed;
 
     public RolloutStatusReader(
         string? sessionsRoot = null,
-        TimeSpan? fallbackRescanInterval = null)
+        TimeSpan? fallbackRescanInterval = null,
+        TimeProvider? timeProvider = null)
     {
         _sessionsRoot = sessionsRoot ?? Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
             ".codex",
             "sessions");
         _fallbackRescanInterval = fallbackRescanInterval ?? DefaultFallbackRescanInterval;
+        _timeProvider = timeProvider ?? TimeProvider.System;
 
         if (_fallbackRescanInterval < TimeSpan.Zero)
         {
@@ -58,6 +74,35 @@ public sealed class RolloutStatusReader : IDisposable
                 "The fallback rescan interval cannot be negative.");
         }
     }
+
+    /// <summary>
+    /// Reports whether a filesystem notification or the safety interval says
+    /// that cached rollout state should be refreshed.
+    /// </summary>
+    public bool HasPendingChanges
+    {
+        get
+        {
+            lock (_sync)
+            {
+                ObjectDisposedException.ThrowIf(_disposed, this);
+                var now = _timeProvider.GetUtcNow();
+                return !_pathIndexInitialized
+                    || _fullRescanRequired
+                    || (_pendingPathChanges.Count > 0
+                        && now >= _nextPathMetadataRetryAtUtc)
+                    || (_contentDirtyPaths.Count > 0
+                        && now >= _nextDirtyContentRetryAtUtc)
+                    || now >= _nextFallbackRescanAtUtc;
+            }
+        }
+    }
+
+    internal int FullRescanCount { get; private set; }
+
+    internal int PathMetadataReadCount { get; private set; }
+
+    internal int ContentRefreshCount { get; private set; }
 
     public CodexExecutionState? ReadLatest()
     {
@@ -72,31 +117,30 @@ public sealed class RolloutStatusReader : IDisposable
             }
 
             EnsureWatcher();
-
-            var now = DateTimeOffset.UtcNow;
-            if (!_rescanRequired
-                && now < _nextFallbackRescanAtUtc
+            RefreshPathIndex(_timeProvider.GetUtcNow());
+            if (!_latestSelectionDirty
                 && _selectedPath is not null
                 && _entries.TryGetValue(_selectedPath, out var selectedEntry))
             {
+                ContentRefreshCount++;
                 if (TryRefreshEntry(selectedEntry))
                 {
-                    if (selectedEntry.Eligible)
+                    CompleteEntryRefresh(selectedEntry);
+                    if (selectedEntry.Eligible && selectedEntry.State is not null)
                     {
                         return selectedEntry.State;
                     }
-
-                    // An active file can only stop being eligible if it was
-                    // replaced or truncated. Find the next eligible rollout.
-                    _rescanRequired = true;
                 }
                 else
                 {
-                    _rescanRequired = true;
+                    _contentDirtyPaths.Add(selectedEntry.Path);
+                    ScheduleDirtyContentRetry();
                 }
+
+                _latestSelectionDirty = true;
             }
 
-            return Rescan(now);
+            return ReadLatestFromIndex();
         }
     }
 
@@ -122,6 +166,7 @@ public sealed class RolloutStatusReader : IDisposable
             }
 
             EnsureWatcher();
+            RefreshPathIndex(_timeProvider.GetUtcNow());
             return ReadRecentCore(prioritySessionIds, recentPathLimit);
         }
     }
@@ -138,50 +183,13 @@ public sealed class RolloutStatusReader : IDisposable
             _disposed = true;
             DisposeWatcher();
             ClearEntries();
+            ClearPathIndex();
         }
     }
 
-    private CodexExecutionState? Rescan(DateTimeOffset now)
+    private CodexExecutionState? ReadLatestFromIndex()
     {
-        var paths = new List<(string Path, DateTime LastWriteTimeUtc)>();
-
-        try
-        {
-            foreach (var path in Directory.EnumerateFiles(
-                         _sessionsRoot,
-                         "rollout-*.jsonl",
-                         SearchOption.AllDirectories))
-            {
-                try
-                {
-                    paths.Add((path, File.GetLastWriteTimeUtc(path)));
-                }
-                catch (IOException)
-                {
-                }
-                catch (UnauthorizedAccessException)
-                {
-                }
-            }
-        }
-        catch (IOException)
-        {
-        }
-        catch (UnauthorizedAccessException)
-        {
-        }
-
-        var presentPaths = new HashSet<string>(paths.Select(item => item.Path), PathComparer);
-        foreach (var stalePath in _entries.Keys.Where(path => !presentPaths.Contains(path)).ToArray())
-        {
-            _entries[stalePath].Dispose();
-            _entries.Remove(stalePath);
-        }
-
-        CodexExecutionState? selectedState = null;
-        string? selectedPath = null;
-
-        foreach (var candidate in paths.OrderByDescending(item => item.LastWriteTimeUtc))
+        foreach (var candidate in _orderedPaths)
         {
             if (!_entries.TryGetValue(candidate.Path, out var entry))
             {
@@ -189,48 +197,57 @@ public sealed class RolloutStatusReader : IDisposable
                 _entries.Add(candidate.Path, entry);
             }
 
-            if (!TryRefreshEntry(entry) || !entry.Eligible || entry.State is null)
+            var forceValidation = _contentDirtyPaths.Contains(candidate.Path);
+            if (!entry.Initialized || forceValidation)
             {
-                continue;
+                ContentRefreshCount++;
+                if (!TryRefreshEntry(entry, forceValidation))
+                {
+                    continue;
+                }
+
+                CompleteEntryRefresh(entry);
             }
 
-            selectedPath = candidate.Path;
-            selectedState = entry.State;
-            break;
+            if (entry.Eligible && entry.State is not null)
+            {
+                _selectedPath = candidate.Path;
+                _latestSelectionDirty = false;
+                return entry.State;
+            }
         }
 
-        _selectedPath = selectedPath;
-        _rescanRequired = false;
-        _nextFallbackRescanAtUtc = now + _fallbackRescanInterval;
-        return selectedState;
+        _selectedPath = null;
+        _latestSelectionDirty = false;
+        return null;
     }
 
     private IReadOnlyList<CodexExecutionState> ReadRecentCore(
         IReadOnlySet<string>? prioritySessionIds,
         int recentPathLimit)
     {
-        var paths = EnumerateRolloutPaths();
-        var presentPaths = new HashSet<string>(paths.Select(item => item.Path), PathComparer);
-        foreach (var stalePath in _entries.Keys.Where(path => !presentPaths.Contains(path)).ToArray())
-        {
-            _entries[stalePath].Dispose();
-            _entries.Remove(stalePath);
-        }
-
         HashSet<string> priorityIds = prioritySessionIds is null
             ? []
             : prioritySessionIds
                 .Where(id => !string.IsNullOrWhiteSpace(id))
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-        var candidates = paths
-            .OrderByDescending(item => item.LastWriteTimeUtc)
-            .Take(recentPathLimit)
-            .ToDictionary(item => item.Path, item => item, PathComparer);
+        var candidates = new Dictionary<string, RolloutPathStamp>(PathComparer);
+        var recentCount = 0;
+        foreach (var item in _orderedPaths)
+        {
+            if (recentCount >= recentPathLimit)
+            {
+                break;
+            }
+
+            candidates.Add(item.Path, item);
+            recentCount++;
+        }
 
         if (priorityIds.Count > 0)
         {
-            foreach (var item in paths)
+            foreach (var item in _orderedPaths)
             {
                 var fileName = Path.GetFileNameWithoutExtension(item.Path);
                 if (priorityIds.Any(id => fileName.EndsWith(id, StringComparison.OrdinalIgnoreCase)))
@@ -240,10 +257,37 @@ public sealed class RolloutStatusReader : IDisposable
             }
         }
 
+        // A changed rollout may keep an old timestamp (for example after a
+        // restore or overwrite). Include notified paths even when they sit
+        // outside the recency window so an active task cannot become stale.
+        foreach (var dirtyPath in _contentDirtyPaths)
+        {
+            if (_indexedPaths.TryGetValue(dirtyPath, out var dirtyStamp))
+            {
+                candidates[dirtyPath] = dirtyStamp;
+            }
+        }
+
+        // Once an active session has been observed, keep tailing it even if a
+        // burst of newer rollouts pushes its original file outside the limit.
+        var activeCutoff = _timeProvider.GetUtcNow() - KnownActiveRetention;
+        foreach (var entry in _entries.Values)
+        {
+            if (IsActiveEntry(entry, activeCutoff)
+                && _indexedPaths.TryGetValue(entry.Path, out var activeStamp))
+            {
+                candidates[entry.Path] = activeStamp;
+            }
+        }
+
         var statesBySession = new Dictionary<string, (CodexExecutionState State, string Path)>(
             StringComparer.OrdinalIgnoreCase);
+        var dirtyRetryDue =
+            _timeProvider.GetUtcNow() >= _nextDirtyContentRetryAtUtc;
 
-        foreach (var candidate in candidates.Values.OrderByDescending(item => item.LastWriteTimeUtc))
+        foreach (var candidate in candidates.Values
+                     .OrderByDescending(item => item.LastWriteTimeUtc)
+                     .ThenBy(item => item.Path, PathComparer))
         {
             if (!_entries.TryGetValue(candidate.Path, out var entry))
             {
@@ -251,7 +295,27 @@ public sealed class RolloutStatusReader : IDisposable
                 _entries.Add(candidate.Path, entry);
             }
 
-            if (!TryRefreshEntry(entry) || !entry.Eligible || entry.State is null)
+            var contentDirty = _contentDirtyPaths.Contains(candidate.Path);
+            if ((!entry.Initialized || contentDirty)
+                && (!contentDirty || dirtyRetryDue))
+            {
+                ContentRefreshCount++;
+                if (!TryRefreshEntry(entry, contentDirty))
+                {
+                    _contentDirtyPaths.Add(candidate.Path);
+                    ScheduleDirtyContentRetry();
+                    if (!entry.Initialized)
+                    {
+                        continue;
+                    }
+                }
+                else
+                {
+                    CompleteEntryRefresh(entry);
+                }
+            }
+
+            if (!entry.Initialized || !entry.Eligible || entry.State is null)
             {
                 continue;
             }
@@ -266,16 +330,86 @@ public sealed class RolloutStatusReader : IDisposable
             }
         }
 
-        return statesBySession.Values
+        if (_contentDirtyPaths.Count == 0)
+        {
+            _nextDirtyContentRetryAtUtc = DateTimeOffset.MinValue;
+        }
+
+        var result = statesBySession.Values
             .OrderByDescending(item => item.State.LastUpdatedAtUtc)
             .ThenBy(item => item.State.SessionId, StringComparer.OrdinalIgnoreCase)
             .Select(item => CloneState(item.State))
             .ToArray();
+        TrimEntryCache(candidates.Keys);
+        return result;
     }
 
-    private List<(string Path, DateTime LastWriteTimeUtc)> EnumerateRolloutPaths()
+    private static bool IsActiveEntry(
+        RolloutCacheEntry entry,
+        DateTimeOffset activeCutoff) =>
+        entry.Initialized
+        && entry.State is { StoppedAtUtc: null } state
+        && state.LastUpdatedAtUtc >= activeCutoff
+        && state.Status is CodexExecutionStatuses.Running
+            or CodexExecutionStatuses.Waiting
+            or CodexExecutionStatuses.Error;
+
+    private void RefreshPathIndex(DateTimeOffset now)
     {
-        var paths = new List<(string Path, DateTime LastWriteTimeUtc)>();
+        if (!_pathIndexInitialized
+            || _fullRescanRequired
+            || now >= _nextFallbackRescanAtUtc)
+        {
+            FullRescanPathIndex(now);
+            return;
+        }
+
+        if (_pendingPathChanges.Count == 0
+            || now < _nextPathMetadataRetryAtUtc)
+        {
+            return;
+        }
+
+        var changedPaths = _pendingPathChanges.ToArray();
+        _pendingPathChanges.Clear();
+        var retryNeeded = false;
+        foreach (var path in changedPaths)
+        {
+            if (!IsRolloutPath(path))
+            {
+                RemoveIndexedPath(path);
+                continue;
+            }
+
+            switch (ReadPathStamp(path, out var stamp))
+            {
+                case PathStampReadResult.Found:
+                    UpsertIndexedPath(stamp, forceContentDirty: true);
+                    break;
+                case PathStampReadResult.Missing:
+                    RemoveIndexedPath(path);
+                    break;
+                case PathStampReadResult.Retry:
+                    _pendingPathChanges.Add(path);
+                    retryNeeded = true;
+                    break;
+            }
+        }
+
+        _nextPathMetadataRetryAtUtc = retryNeeded
+            ? now + TransientReadRetryInterval
+            : DateTimeOffset.MinValue;
+    }
+
+    private void FullRescanPathIndex(DateTimeOffset now)
+    {
+        FullRescanCount++;
+        var wasInitialized = _pathIndexInitialized;
+        var explicitlyChangedPaths =
+            _pendingPathChanges.ToHashSet(PathComparer);
+        var presentPaths = new HashSet<string>(PathComparer);
+        var enumerationCompleted = false;
+        var metadataReadsCompleted = true;
 
         try
         {
@@ -284,17 +418,27 @@ public sealed class RolloutStatusReader : IDisposable
                          "rollout-*.jsonl",
                          SearchOption.AllDirectories))
             {
-                try
+                var readResult = ReadPathStamp(path, out var stamp);
+                if (readResult == PathStampReadResult.Missing)
                 {
-                    paths.Add((path, File.GetLastWriteTimeUtc(path)));
+                    continue;
                 }
-                catch (IOException)
+
+                presentPaths.Add(path);
+                if (readResult == PathStampReadResult.Retry)
                 {
+                    metadataReadsCompleted = false;
+                    _pendingPathChanges.Add(path);
+                    continue;
                 }
-                catch (UnauthorizedAccessException)
-                {
-                }
+
+                UpsertIndexedPath(
+                    stamp,
+                    forceContentDirty: explicitlyChangedPaths.Contains(path),
+                    markNewContentDirty: wasInitialized);
             }
+
+            enumerationCompleted = true;
         }
         catch (IOException)
         {
@@ -303,7 +447,208 @@ public sealed class RolloutStatusReader : IDisposable
         {
         }
 
-        return paths;
+        if (enumerationCompleted)
+        {
+            foreach (var stalePath in _indexedPaths.Keys
+                         .Where(path => !presentPaths.Contains(path))
+                         .ToArray())
+            {
+                RemoveIndexedPath(stalePath);
+            }
+        }
+
+        if (enumerationCompleted && metadataReadsCompleted)
+        {
+            // Notifications delivered while the scan holds _sync are queued
+            // by FileSystemWatcher and run after this method releases it.
+            _pendingPathChanges.Clear();
+            _nextPathMetadataRetryAtUtc = DateTimeOffset.MinValue;
+        }
+        else if (_pendingPathChanges.Count > 0)
+        {
+            _nextPathMetadataRetryAtUtc =
+                now + TransientReadRetryInterval;
+        }
+
+        _pathIndexInitialized = true;
+        _fullRescanRequired = false;
+        var nextInterval = enumerationCompleted
+            ? EffectiveFallbackRescanInterval()
+            : MinInterval(
+                _fallbackRescanInterval,
+                WatcherUnavailableRescanInterval);
+        _nextFallbackRescanAtUtc = now + nextInterval;
+    }
+
+    private TimeSpan EffectiveFallbackRescanInterval()
+    {
+        if (_watcher is not null
+            || _fallbackRescanInterval <= WatcherUnavailableRescanInterval)
+        {
+            return _fallbackRescanInterval;
+        }
+
+        return WatcherUnavailableRescanInterval;
+    }
+
+    private static TimeSpan MinInterval(TimeSpan left, TimeSpan right) =>
+        left <= right ? left : right;
+
+    private static bool IsRolloutPath(string path)
+    {
+        var fileName = Path.GetFileName(path);
+        return fileName.StartsWith("rollout-", StringComparison.OrdinalIgnoreCase)
+            && fileName.EndsWith(".jsonl", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private PathStampReadResult ReadPathStamp(string path, out RolloutPathStamp stamp)
+    {
+        PathMetadataReadCount++;
+        try
+        {
+            var fileInfo = new FileInfo(path);
+            fileInfo.Refresh();
+            if (!fileInfo.Exists)
+            {
+                stamp = default!;
+                return PathStampReadResult.Missing;
+            }
+
+            stamp = new RolloutPathStamp(
+                path,
+                fileInfo.LastWriteTimeUtc,
+                fileInfo.CreationTimeUtc,
+                fileInfo.Length);
+            return PathStampReadResult.Found;
+        }
+        catch (IOException)
+        {
+            stamp = default!;
+            return PathStampReadResult.Retry;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            stamp = default!;
+            return PathStampReadResult.Retry;
+        }
+    }
+
+    private void UpsertIndexedPath(
+        RolloutPathStamp stamp,
+        bool forceContentDirty,
+        bool markNewContentDirty = true)
+    {
+        if (_indexedPaths.TryGetValue(stamp.Path, out var previous))
+        {
+            var metadataChanged = previous.LastWriteTimeUtc != stamp.LastWriteTimeUtc
+                || previous.CreationTimeUtc != stamp.CreationTimeUtc
+                || previous.Length != stamp.Length;
+            if (metadataChanged)
+            {
+                _orderedPaths.Remove(previous);
+                _orderedPaths.Add(stamp);
+                _indexedPaths[stamp.Path] = stamp;
+                _latestSelectionDirty = true;
+            }
+
+            if (forceContentDirty || metadataChanged)
+            {
+                _contentDirtyPaths.Add(stamp.Path);
+                _nextDirtyContentRetryAtUtc = DateTimeOffset.MinValue;
+                _latestSelectionDirty = true;
+            }
+
+            return;
+        }
+
+        _indexedPaths.Add(stamp.Path, stamp);
+        _orderedPaths.Add(stamp);
+        _latestSelectionDirty = true;
+        if (markNewContentDirty)
+        {
+            _contentDirtyPaths.Add(stamp.Path);
+            _nextDirtyContentRetryAtUtc = DateTimeOffset.MinValue;
+        }
+    }
+
+    private void RemoveIndexedPath(string path)
+    {
+        if (_indexedPaths.Remove(path, out var stamp))
+        {
+            _orderedPaths.Remove(stamp);
+            _latestSelectionDirty = true;
+        }
+
+        _pendingPathChanges.Remove(path);
+        if (_pendingPathChanges.Count == 0)
+        {
+            _nextPathMetadataRetryAtUtc = DateTimeOffset.MinValue;
+        }
+        _contentDirtyPaths.Remove(path);
+        if (_contentDirtyPaths.Count == 0)
+        {
+            _nextDirtyContentRetryAtUtc = DateTimeOffset.MinValue;
+        }
+        if (_entries.Remove(path, out var entry))
+        {
+            entry.Dispose();
+        }
+
+        if (PathComparer.Equals(_selectedPath, path))
+        {
+            _selectedPath = null;
+        }
+    }
+
+    private void TrimEntryCache(IEnumerable<string> protectedPaths)
+    {
+        if (_entries.Count <= MaxCachedEntries)
+        {
+            return;
+        }
+
+        var protectedSet = protectedPaths.ToHashSet(PathComparer);
+        var removeCount = _entries.Count - MaxCachedEntries;
+        var removablePaths = _entries.Keys
+            .Where(path => !protectedSet.Contains(path))
+            .OrderBy(path => _indexedPaths.TryGetValue(path, out var stamp)
+                ? stamp.LastWriteTimeUtc
+                : DateTime.MinValue)
+            .Take(removeCount)
+            .ToArray();
+
+        foreach (var path in removablePaths)
+        {
+            if (_entries.Remove(path, out var entry))
+            {
+                entry.Dispose();
+            }
+        }
+    }
+
+    private void ScheduleDirtyContentRetry()
+    {
+        _nextDirtyContentRetryAtUtc =
+            _timeProvider.GetUtcNow() + TransientReadRetryInterval;
+    }
+
+    private void CompleteEntryRefresh(RolloutCacheEntry entry)
+    {
+        if (entry.HasUnreadBytes)
+        {
+            _contentDirtyPaths.Add(entry.Path);
+            _latestSelectionDirty = true;
+            ScheduleDirtyContentRetry();
+            return;
+        }
+
+        _contentDirtyPaths.Remove(entry.Path);
+    }
+
+    private void QueuePathChange(string path)
+    {
+        _pendingPathChanges.Add(path);
+        _nextPathMetadataRetryAtUtc = DateTimeOffset.MinValue;
     }
 
     private static CodexExecutionState CloneState(CodexExecutionState state)
@@ -314,8 +659,11 @@ public sealed class RolloutStatusReader : IDisposable
         };
     }
 
-    private static bool TryRefreshEntry(RolloutCacheEntry entry)
+    private static bool TryRefreshEntry(
+        RolloutCacheEntry entry,
+        bool forceValidation = false)
     {
+        entry.HasUnreadBytes = false;
         try
         {
             var fileInfo = new FileInfo(entry.Path);
@@ -329,7 +677,8 @@ public sealed class RolloutStatusReader : IDisposable
             var currentLastWriteTimeUtc = fileInfo.LastWriteTimeUtc;
             var currentCreationTimeUtc = fileInfo.CreationTimeUtc;
 
-            if (entry.Initialized
+            if (!forceValidation
+                && entry.Initialized
                 && currentLength == entry.BytesRead
                 && currentLastWriteTimeUtc == entry.LastWriteTimeUtc
                 && currentCreationTimeUtc == entry.CreationTimeUtc)
@@ -375,6 +724,7 @@ public sealed class RolloutStatusReader : IDisposable
             {
                 entry.CreationTimeUtc = fileInfo.CreationTimeUtc;
                 entry.LastWriteTimeUtc = fileInfo.LastWriteTimeUtc;
+                entry.HasUnreadBytes = fileInfo.Length > entry.BytesRead;
             }
 
             entry.Initialized = true;
@@ -719,7 +1069,7 @@ public sealed class RolloutStatusReader : IDisposable
                     | NotifyFilters.DirectoryName
                     | NotifyFilters.LastWrite
                     | NotifyFilters.Size,
-                InternalBufferSize = 16 * 1024,
+                InternalBufferSize = 64 * 1024,
             };
 
             watcher.Changed += OnRolloutChanged;
@@ -752,14 +1102,9 @@ public sealed class RolloutStatusReader : IDisposable
                 return;
             }
 
-            // Appends to the selected file are detected by its cached length.
-            // Any other path may be a newer eligible session and needs ordering.
-            if (args.ChangeType is WatcherChangeTypes.Created or WatcherChangeTypes.Deleted
-                || _selectedPath is null
-                || !PathComparer.Equals(args.FullPath, _selectedPath))
-            {
-                _rescanRequired = true;
-            }
+            // Keep callbacks constant-time and coalesce bursts from a single
+            // append. Metadata and content are read on the next consumer pass.
+            QueuePathChange(args.FullPath);
         }
     }
 
@@ -769,7 +1114,8 @@ public sealed class RolloutStatusReader : IDisposable
         {
             if (!_disposed)
             {
-                _rescanRequired = true;
+                QueuePathChange(args.OldFullPath);
+                QueuePathChange(args.FullPath);
             }
         }
     }
@@ -785,7 +1131,8 @@ public sealed class RolloutStatusReader : IDisposable
 
             // Buffer overflow or watcher failure: force a full scan now and
             // recreate the watcher so subsequent changes are signalled again.
-            _rescanRequired = true;
+            _fullRescanRequired = true;
+            _latestSelectionDirty = true;
             DisposeWatcher();
         }
     }
@@ -794,9 +1141,14 @@ public sealed class RolloutStatusReader : IDisposable
     {
         DisposeWatcher();
         ClearEntries();
+        ClearPathIndex();
+        _fullRescanRequired = true;
+        _latestSelectionDirty = true;
+        _pathIndexInitialized = false;
         _selectedPath = null;
-        _rescanRequired = true;
         _nextFallbackRescanAtUtc = DateTimeOffset.MinValue;
+        _nextDirtyContentRetryAtUtc = DateTimeOffset.MinValue;
+        _nextPathMetadataRetryAtUtc = DateTimeOffset.MinValue;
     }
 
     private void DisposeWatcher()
@@ -824,6 +1176,18 @@ public sealed class RolloutStatusReader : IDisposable
         }
 
         _entries.Clear();
+    }
+
+    private void ClearPathIndex()
+    {
+        _indexedPaths.Clear();
+        _orderedPaths.Clear();
+        _pendingPathChanges.Clear();
+        _contentDirtyPaths.Clear();
+        _selectedPath = null;
+        _latestSelectionDirty = true;
+        _nextDirtyContentRetryAtUtc = DateTimeOffset.MinValue;
+        _nextPathMetadataRetryAtUtc = DateTimeOffset.MinValue;
     }
 
     private static void ApplyEvent(
@@ -1056,6 +1420,47 @@ public sealed class RolloutStatusReader : IDisposable
         return false;
     }
 
+    private sealed record RolloutPathStamp(
+        string Path,
+        DateTime LastWriteTimeUtc,
+        DateTime CreationTimeUtc,
+        long Length);
+
+    private enum PathStampReadResult
+    {
+        Found,
+        Missing,
+        Retry,
+    }
+
+    private sealed class RolloutPathStampComparer : IComparer<RolloutPathStamp>
+    {
+        public static RolloutPathStampComparer Instance { get; } = new();
+
+        public int Compare(RolloutPathStamp? left, RolloutPathStamp? right)
+        {
+            if (ReferenceEquals(left, right))
+            {
+                return 0;
+            }
+
+            if (left is null)
+            {
+                return 1;
+            }
+
+            if (right is null)
+            {
+                return -1;
+            }
+
+            var timestampComparison = right.LastWriteTimeUtc.CompareTo(left.LastWriteTimeUtc);
+            return timestampComparison != 0
+                ? timestampComparison
+                : PathComparer.Compare(left.Path, right.Path);
+        }
+    }
+
     private sealed class RolloutCacheEntry : IDisposable
     {
         public RolloutCacheEntry(string path)
@@ -1088,6 +1493,8 @@ public sealed class RolloutStatusReader : IDisposable
 
         public byte[] Checkpoint { get; set; } = [];
 
+        public bool HasUnreadBytes { get; set; }
+
         public void Reset()
         {
             State = null;
@@ -1098,6 +1505,7 @@ public sealed class RolloutStatusReader : IDisposable
             PendingInputCallIds.Clear();
             CheckpointOffset = 0;
             Checkpoint = [];
+            HasUnreadBytes = false;
         }
 
         public void Dispose()

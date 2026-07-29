@@ -222,7 +222,7 @@ jobs:
           $releaseNotes = @"
           ## Install
 
-          Download **CodexStatusSetup-$env:RELEASE_VERSION-x64.exe** and run it. The installer includes the required runtime, configures Codex lifecycle hooks, and enables startup with Windows.
+          Download **CodexStatusSetup-$env:RELEASE_VERSION-x64.exe** and run it. The installer includes the required runtime, configures Codex lifecycle hooks, and enables **Start with Windows** by default. You can change it in Codex Status settings, and updates preserve your choice.
           "@
 
           $arguments = @(

@@ -94,6 +94,228 @@ public sealed class RolloutStatusReaderTests : IDisposable
     }
 
     [Fact]
+    public async Task ReadRecent_RepeatedReadsWithoutEventsReuseTheInMemoryIndex()
+    {
+        Directory.CreateDirectory(_directory);
+        var rollout = Path.Combine(_directory, "rollout-indexed.jsonl");
+        await WriteRolloutAsync(
+            rollout,
+            SessionMeta("indexed-thread", "2026-07-13T05:30:00Z"),
+            TaskStarted("indexed-turn", "2026-07-13T05:30:01Z"));
+
+        using var reader = new RolloutStatusReader(
+            _directory,
+            TimeSpan.FromHours(1));
+        Assert.Single(reader.ReadRecent());
+
+        var fullScans = reader.FullRescanCount;
+        var metadataReads = reader.PathMetadataReadCount;
+        var contentRefreshes = reader.ContentRefreshCount;
+        for (var index = 0; index < 100; index++)
+        {
+            Assert.Single(reader.ReadRecent());
+        }
+
+        Assert.Equal(1, fullScans);
+        Assert.Equal(fullScans, reader.FullRescanCount);
+        Assert.Equal(metadataReads, reader.PathMetadataReadCount);
+        Assert.Equal(contentRefreshes, reader.ContentRefreshCount);
+    }
+
+    [Fact]
+    public async Task ReadRecent_WatcherAddsNewSessionWithoutAFullRescan()
+    {
+        Directory.CreateDirectory(_directory);
+        var original = Path.Combine(_directory, "rollout-original.jsonl");
+        await WriteRolloutAsync(
+            original,
+            SessionMeta("original-thread", "2026-07-13T05:40:00Z"),
+            TaskStarted("original-turn", "2026-07-13T05:40:01Z"));
+
+        using var reader = new RolloutStatusReader(
+            _directory,
+            TimeSpan.FromHours(1));
+        Assert.Single(reader.ReadRecent());
+        Assert.Equal(1, reader.FullRescanCount);
+
+        var created = Path.Combine(_directory, "rollout-created.jsonl");
+        await WriteRolloutAsync(
+            created,
+            SessionMeta("created-thread", "2026-07-13T05:41:00Z"),
+            TaskStarted("created-turn", "2026-07-13T05:41:01Z"));
+        File.SetLastWriteTimeUtc(created, DateTime.UtcNow.AddMinutes(1));
+
+        var states = await WaitForRecentStatesAsync(
+            reader,
+            items => items.Any(state => state.SessionId == "created-thread"),
+            TimeSpan.FromSeconds(5));
+
+        Assert.Contains(states, state => state.SessionId == "created-thread");
+        Assert.Equal(1, reader.FullRescanCount);
+    }
+
+    [Fact]
+    public async Task ReadRecent_KeepsKnownActiveSessionOutsideTheRecentLimit()
+    {
+        Directory.CreateDirectory(_directory);
+        var older = Path.Combine(_directory, "rollout-known-active.jsonl");
+        await WriteRolloutAsync(
+            older,
+            SessionMeta("known-active", "2026-07-28T20:45:00Z"),
+            TaskStarted("known-active-turn", "2026-07-28T20:45:01Z"));
+
+        using var reader = new RolloutStatusReader(
+            _directory,
+            TimeSpan.FromHours(1));
+        Assert.Equal(
+            "known-active",
+            Assert.Single(reader.ReadRecent(recentPathLimit: 1)).SessionId);
+
+        var newer = Path.Combine(_directory, "rollout-new-active.jsonl");
+        await WriteRolloutAsync(
+            newer,
+            SessionMeta("new-active", "2026-07-28T20:46:00Z"),
+            TaskStarted("new-active-turn", "2026-07-28T20:46:01Z"));
+        File.SetLastWriteTimeUtc(newer, DateTime.UtcNow.AddMinutes(1));
+
+        var discovered = await WaitForRecentStatesAsync(
+            reader,
+            states => states.Count == 2,
+            TimeSpan.FromSeconds(5),
+            recentPathLimit: 1);
+        Assert.Contains(discovered, state => state.SessionId == "known-active");
+        Assert.Contains(discovered, state => state.SessionId == "new-active");
+
+        var stable = reader.ReadRecent(recentPathLimit: 1);
+        Assert.Contains(stable, state => state.SessionId == "known-active");
+        Assert.Contains(stable, state => state.SessionId == "new-active");
+        Assert.Equal(1, reader.FullRescanCount);
+    }
+
+    [Fact]
+    public async Task ReadRecent_WatcherRefreshesDirtyPathOutsideTheRecentLimit()
+    {
+        Directory.CreateDirectory(_directory);
+        var older = Path.Combine(_directory, "rollout-older.jsonl");
+        await WriteRolloutAsync(
+            older,
+            SessionMeta("older-thread", "2026-07-13T05:50:00Z"),
+            TaskStarted("older-turn", "2026-07-13T05:50:01Z"));
+        var oldTimestamp = new DateTime(2026, 7, 13, 5, 50, 1, DateTimeKind.Utc);
+        File.SetLastWriteTimeUtc(older, oldTimestamp);
+
+        var newer = Path.Combine(_directory, "rollout-newer.jsonl");
+        await WriteRolloutAsync(
+            newer,
+            SessionMeta("newer-thread", "2026-07-13T05:51:00Z"),
+            TaskStarted("newer-turn", "2026-07-13T05:51:01Z"));
+        File.SetLastWriteTimeUtc(
+            newer,
+            new DateTime(2026, 7, 13, 5, 51, 1, DateTimeKind.Utc));
+
+        using var reader = new RolloutStatusReader(
+            _directory,
+            TimeSpan.FromHours(1));
+        Assert.Equal("newer-thread", Assert.Single(reader.ReadRecent(recentPathLimit: 1)).SessionId);
+
+        await File.AppendAllTextAsync(
+            older,
+            TaskCompleted("older-turn", "2026-07-13T05:52:00Z") +
+            Environment.NewLine);
+        File.SetLastWriteTimeUtc(older, oldTimestamp);
+
+        var states = await WaitForRecentStatesAsync(
+            reader,
+            items => items.Any(state =>
+                state.SessionId == "older-thread"
+                && state.Status == CodexExecutionStatuses.Completed),
+            TimeSpan.FromSeconds(5),
+            recentPathLimit: 1);
+
+        Assert.Contains(
+            states,
+            state => state.SessionId == "older-thread"
+                && state.Status == CodexExecutionStatuses.Completed);
+        Assert.Equal(1, reader.FullRescanCount);
+    }
+
+    [Fact]
+    public async Task ReadRecent_WatcherValidatesSameStampReplacement()
+    {
+        Directory.CreateDirectory(_directory);
+        var rollout = Path.Combine(_directory, "rollout-replaced-same-stamp.jsonl");
+        var originalText = string.Join(
+            Environment.NewLine,
+            SessionMeta("old-session-01", "2026-07-13T05:55:00Z"),
+            TaskStarted("old-turn-01", "2026-07-13T05:55:01Z")) + Environment.NewLine;
+        var replacementText = string.Join(
+            Environment.NewLine,
+            SessionMeta("new-session-01", "2026-07-13T05:56:00Z"),
+            TaskStarted("new-turn-01", "2026-07-13T05:56:01Z")) + Environment.NewLine;
+        Assert.Equal(
+            System.Text.Encoding.UTF8.GetByteCount(originalText),
+            System.Text.Encoding.UTF8.GetByteCount(replacementText));
+
+        await File.WriteAllTextAsync(rollout, originalText);
+        var originalWriteTime = new DateTime(
+            2026,
+            7,
+            13,
+            5,
+            55,
+            1,
+            DateTimeKind.Utc);
+        File.SetLastWriteTimeUtc(rollout, originalWriteTime);
+
+        using var reader = new RolloutStatusReader(
+            _directory,
+            TimeSpan.FromHours(1));
+        Assert.Equal("old-session-01", Assert.Single(reader.ReadRecent()).SessionId);
+
+        await File.WriteAllTextAsync(rollout, replacementText);
+        File.SetLastWriteTimeUtc(rollout, originalWriteTime);
+
+        var states = await WaitForRecentStatesAsync(
+            reader,
+            items => items.Any(state => state.SessionId == "new-session-01"),
+            TimeSpan.FromSeconds(5));
+
+        Assert.Equal("new-turn-01", Assert.Single(states).TurnId);
+        Assert.Equal(1, reader.FullRescanCount);
+    }
+
+    [Fact]
+    public async Task ReadRecent_WatcherRemovesDeletedSessionWithoutAFullRescan()
+    {
+        Directory.CreateDirectory(_directory);
+        var first = Path.Combine(_directory, "rollout-delete-first.jsonl");
+        await WriteRolloutAsync(
+            first,
+            SessionMeta("delete-first", "2026-07-13T05:57:00Z"),
+            TaskStarted("delete-first-turn", "2026-07-13T05:57:01Z"));
+        var second = Path.Combine(_directory, "rollout-delete-second.jsonl");
+        await WriteRolloutAsync(
+            second,
+            SessionMeta("delete-second", "2026-07-13T05:58:00Z"),
+            TaskStarted("delete-second-turn", "2026-07-13T05:58:01Z"));
+
+        using var reader = new RolloutStatusReader(
+            _directory,
+            TimeSpan.FromHours(1));
+        Assert.Equal(2, reader.ReadRecent().Count);
+        File.Delete(second);
+
+        var states = await WaitForRecentStatesAsync(
+            reader,
+            items => items.Count == 1
+                && items[0].SessionId == "delete-first",
+            TimeSpan.FromSeconds(5));
+
+        Assert.Equal("delete-first", Assert.Single(states).SessionId);
+        Assert.Equal(1, reader.FullRescanCount);
+    }
+
+    [Fact]
     public async Task ReadLatest_AppliesOnlyCompleteAppendedLines()
     {
         Directory.CreateDirectory(_directory);
@@ -339,7 +561,12 @@ public sealed class RolloutStatusReaderTests : IDisposable
             TaskCompleted("first-turn", "2026-07-15T11:02:01Z"),
         ]);
 
-        var updated = reader.ReadRecent();
+        var updated = await WaitForRecentStatesAsync(
+            reader,
+            states => states.Any(state =>
+                state.SessionId == "first-thread"
+                && state.Status == CodexExecutionStatuses.Completed),
+            TimeSpan.FromSeconds(5));
         var updatedFirst = Assert.Single(updated, state => state.SessionId == "first-thread");
         var unchangedSecond = Assert.Single(updated, state => state.SessionId == "second-thread");
 
@@ -414,7 +641,10 @@ public sealed class RolloutStatusReaderTests : IDisposable
             rollout,
             TaskStarted("next-turn", "2026-07-15T13:01:00Z") + Environment.NewLine);
 
-        var nextTurn = Assert.Single(reader.ReadRecent());
+        var nextTurn = Assert.Single(await WaitForRecentStatesAsync(
+            reader,
+            states => states.Any(state => state.TurnId == "next-turn"),
+            TimeSpan.FromSeconds(5)));
         Assert.Equal("next-turn", nextTurn.TurnId);
         Assert.Null(nextTurn.TaskTitle);
     }
@@ -446,7 +676,10 @@ public sealed class RolloutStatusReaderTests : IDisposable
             rollout,
             FunctionCallOutput("input-call", "2026-07-28T20:00:04Z") +
             Environment.NewLine);
-        var resumed = Assert.Single(reader.ReadRecent());
+        var resumed = Assert.Single(await WaitForRecentStatesAsync(
+            reader,
+            states => states.Any(state => state.Status == CodexExecutionStatuses.Running),
+            TimeSpan.FromSeconds(5)));
         Assert.Equal(CodexExecutionStatuses.Running, resumed.Status);
         Assert.Equal(CodexActivityLabels.ProcessingRequest, resumed.Activity);
         Assert.Null(resumed.WaitingSinceAtUtc);
@@ -477,7 +710,10 @@ public sealed class RolloutStatusReaderTests : IDisposable
             rollout,
             TaskCompleted("multiple-turn", "2026-07-28T21:00:05Z") +
             Environment.NewLine);
-        var completed = Assert.Single(reader.ReadRecent());
+        var completed = Assert.Single(await WaitForRecentStatesAsync(
+            reader,
+            states => states.Any(state => state.Status == CodexExecutionStatuses.Completed),
+            TimeSpan.FromSeconds(5)));
         Assert.Equal(CodexExecutionStatuses.Completed, completed.Status);
         Assert.Null(completed.WaitingSinceAtUtc);
     }
@@ -502,6 +738,29 @@ public sealed class RolloutStatusReaderTests : IDisposable
         while (DateTime.UtcNow < expiresAt);
 
         return state;
+    }
+
+    private static async Task<IReadOnlyList<CodexExecutionState>> WaitForRecentStatesAsync(
+        RolloutStatusReader reader,
+        Func<IReadOnlyList<CodexExecutionState>, bool> predicate,
+        TimeSpan timeout,
+        int recentPathLimit = 32)
+    {
+        var expiresAt = DateTime.UtcNow + timeout;
+        IReadOnlyList<CodexExecutionState> states;
+        do
+        {
+            states = reader.ReadRecent(recentPathLimit: recentPathLimit);
+            if (predicate(states))
+            {
+                return states;
+            }
+
+            await Task.Delay(25);
+        }
+        while (DateTime.UtcNow < expiresAt);
+
+        return states;
     }
 
     private static Task WriteRolloutAsync(string path, params string[] lines)

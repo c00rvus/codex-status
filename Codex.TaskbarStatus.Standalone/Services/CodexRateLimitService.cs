@@ -77,8 +77,15 @@ internal sealed class CodexRateLimitService : IAsyncDisposable
             }
         }
 
-        await _appServer.DisposeAsync().ConfigureAwait(false);
-        _shutdown.Dispose();
+        try
+        {
+            await _appServer.DisposeAsync().ConfigureAwait(false);
+        }
+        finally
+        {
+            _rolloutReader.Dispose();
+            _shutdown.Dispose();
+        }
     }
 
     private async Task RefreshCoreAsync()

@@ -1,6 +1,6 @@
 # Codex Status
 
-Codex Status is a standalone Windows 11 taskbar app that shows Codex activity, changed files, subagents, elapsed time, and usage limits. It runs locally and starts with Windows.
+Codex Status is a standalone Windows 11 taskbar app that shows Codex activity, changed files, subagents, elapsed time, and usage limits. It runs locally and can start automatically with Windows.
 
 ## Install
 
@@ -10,7 +10,7 @@ Codex Status is a standalone Windows 11 taskbar app that shows Codex activity, c
 2. Download `CodexStatusSetup-<version>-x64.exe`.
 3. Run the installer.
 
-The installer includes the required runtime, configures the Codex lifecycle hooks, and starts Codex Status. No terminal commands, .NET SDK, or Developer Mode are required.
+The installer includes the required runtime, configures the Codex lifecycle hooks, starts Codex Status, and enables **Start with Windows** by default. You can turn it off in the app settings, and updates preserve your choice. No terminal commands, .NET SDK, or Developer Mode are required.
 
 ### Manual installation
 
@@ -22,7 +22,7 @@ cd codex-status
 .\install.cmd
 ```
 
-`install.cmd` builds the standalone app into a separate source-installation directory, configures the Codex hooks, and enables startup with Windows. It does not overwrite an installer-managed copy.
+`install.cmd` builds the standalone app into a separate source-installation directory, configures the Codex hooks, and enables **Start with Windows** on the first installation. You can turn it off in the app settings, and updates preserve your choice. It does not overwrite an installer-managed copy.
 
 ## Features
 
@@ -34,13 +34,14 @@ cd codex-status
 - Animated spinners with a configurable color.
 - Configurable visibility and order for every indicator.
 - Compact mode and optional hide-when-idle behavior.
+- Optional automatic startup with Windows.
 - Local-only status processing with no telemetry.
 
 ## Settings and position
 
 Click the taskbar widget to open its details. Use the notification-area icon to open settings, show details, restart, or exit.
 
-Settings let you select a monitor and use automatic, left, center, right, or manual taskbar placement. Displayed indicators can be reordered or disabled independently.
+Settings let you select a monitor and use automatic, left, center, right, or manual taskbar placement. Displayed indicators can be reordered or disabled independently, and **Start with Windows** can be enabled or disabled at any time.
 
 ## Update and uninstall
 
@@ -70,7 +71,7 @@ For a local development build:
 Build the installer with [Inno Setup 6](https://jrsoftware.org/isinfo.php):
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Compile-Installer.ps1 -Version 2.0.0
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Compile-Installer.ps1 -Version 2.3.0
 ```
 
 Pushing a `vX.Y.Z` tag runs GitHub Actions and publishes the installer with `SHA256SUMS.txt`.

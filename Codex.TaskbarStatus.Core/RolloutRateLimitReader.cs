@@ -6,19 +6,32 @@ namespace Codex.TaskbarStatus.Core;
 /// Reads a bounded tail from recent Codex rollouts without blocking their writer.
 /// Rollout files are never modified.
 /// </summary>
-public sealed class RolloutRateLimitReader
+public sealed class RolloutRateLimitReader : IDisposable
 {
     public const int DefaultMaxRecentFiles = 16;
     public const int DefaultTailBytes = 128 * 1024;
+    private static readonly TimeSpan DefaultFallbackRescanInterval = TimeSpan.FromMinutes(1);
+    private static readonly TimeSpan WatcherUnavailableRescanInterval = TimeSpan.FromSeconds(2);
 
     private readonly string _sessionsRoot;
     private readonly int _maxRecentFiles;
     private readonly int _tailBytes;
+    private readonly TimeSpan _fallbackRescanInterval;
+    private readonly TimeProvider _timeProvider;
+    private readonly object _sync = new();
+    private FileSystemWatcher? _watcher;
+    private CodexRateLimitSnapshot _cachedSnapshot = CodexRateLimitSnapshot.Unknown;
+    private DateTimeOffset _nextFallbackRescanAtUtc = DateTimeOffset.MinValue;
+    private DateTime _rootLastWriteTimeUtc;
+    private bool _dirty = true;
+    private bool _disposed;
 
     public RolloutRateLimitReader(
         string? sessionsRoot = null,
         int maxRecentFiles = DefaultMaxRecentFiles,
-        int tailBytes = DefaultTailBytes)
+        int tailBytes = DefaultTailBytes,
+        TimeSpan? fallbackRescanInterval = null,
+        TimeProvider? timeProvider = null)
     {
         if (maxRecentFiles <= 0)
         {
@@ -36,15 +49,84 @@ public sealed class RolloutRateLimitReader
             "sessions");
         _maxRecentFiles = maxRecentFiles;
         _tailBytes = tailBytes;
+        _fallbackRescanInterval =
+            fallbackRescanInterval ?? DefaultFallbackRescanInterval;
+        _timeProvider = timeProvider ?? TimeProvider.System;
+
+        if (_fallbackRescanInterval < TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(fallbackRescanInterval),
+                "The fallback rescan interval cannot be negative.");
+        }
     }
 
     public CodexRateLimitSnapshot ReadLatest()
     {
-        if (!Directory.Exists(_sessionsRoot))
+        lock (_sync)
         {
-            return CodexRateLimitSnapshot.Unknown;
-        }
+            ObjectDisposedException.ThrowIf(_disposed, this);
 
+            if (!Directory.Exists(_sessionsRoot))
+            {
+                ResetForMissingRoot();
+                return CodexRateLimitSnapshot.Unknown;
+            }
+
+            try
+            {
+                var rootLastWriteTimeUtc = Directory.GetLastWriteTimeUtc(_sessionsRoot);
+                if (rootLastWriteTimeUtc != _rootLastWriteTimeUtc)
+                {
+                    _rootLastWriteTimeUtc = rootLastWriteTimeUtc;
+                    _dirty = true;
+                }
+            }
+            catch (IOException)
+            {
+            }
+            catch (UnauthorizedAccessException)
+            {
+            }
+
+            EnsureWatcher();
+            var now = _timeProvider.GetUtcNow();
+            if (!_dirty && now < _nextFallbackRescanAtUtc)
+            {
+                return _cachedSnapshot;
+            }
+
+            _cachedSnapshot = ScanLatest();
+            _dirty = false;
+            FullScanCount++;
+            var interval = _watcher is null
+                ? MinInterval(
+                    _fallbackRescanInterval,
+                    WatcherUnavailableRescanInterval)
+                : _fallbackRescanInterval;
+            _nextFallbackRescanAtUtc = now + interval;
+            return _cachedSnapshot;
+        }
+    }
+
+    internal int FullScanCount { get; private set; }
+
+    public void Dispose()
+    {
+        lock (_sync)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+            DisposeWatcher();
+        }
+    }
+
+    private CodexRateLimitSnapshot ScanLatest()
+    {
         CodexRateLimitSnapshot? latest = null;
 
         foreach (var file in EnumerateRecentFiles())
@@ -163,6 +245,100 @@ public sealed class RolloutRateLimitReader
             }
         }
     }
+
+    private void EnsureWatcher()
+    {
+        if (_watcher is not null)
+        {
+            return;
+        }
+
+        try
+        {
+            var watcher = new FileSystemWatcher(_sessionsRoot, "rollout-*.jsonl")
+            {
+                IncludeSubdirectories = true,
+                NotifyFilter = NotifyFilters.FileName
+                    | NotifyFilters.DirectoryName
+                    | NotifyFilters.LastWrite
+                    | NotifyFilters.Size,
+                InternalBufferSize = 16 * 1024,
+            };
+            watcher.Changed += OnRolloutChanged;
+            watcher.Created += OnRolloutChanged;
+            watcher.Deleted += OnRolloutChanged;
+            watcher.Renamed += OnRolloutRenamed;
+            watcher.Error += OnWatcherError;
+            watcher.EnableRaisingEvents = true;
+            _watcher = watcher;
+        }
+        catch (ArgumentException)
+        {
+        }
+        catch (IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
+    }
+
+    private void OnRolloutChanged(object sender, FileSystemEventArgs args)
+    {
+        lock (_sync)
+        {
+            if (!_disposed)
+            {
+                _dirty = true;
+            }
+        }
+    }
+
+    private void OnRolloutRenamed(object sender, RenamedEventArgs args) =>
+        OnRolloutChanged(sender, args);
+
+    private void OnWatcherError(object sender, ErrorEventArgs args)
+    {
+        lock (_sync)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _dirty = true;
+            DisposeWatcher();
+        }
+    }
+
+    private void ResetForMissingRoot()
+    {
+        DisposeWatcher();
+        _cachedSnapshot = CodexRateLimitSnapshot.Unknown;
+        _nextFallbackRescanAtUtc = DateTimeOffset.MinValue;
+        _rootLastWriteTimeUtc = default;
+        _dirty = true;
+    }
+
+    private void DisposeWatcher()
+    {
+        if (_watcher is null)
+        {
+            return;
+        }
+
+        _watcher.EnableRaisingEvents = false;
+        _watcher.Changed -= OnRolloutChanged;
+        _watcher.Created -= OnRolloutChanged;
+        _watcher.Deleted -= OnRolloutChanged;
+        _watcher.Renamed -= OnRolloutRenamed;
+        _watcher.Error -= OnWatcherError;
+        _watcher.Dispose();
+        _watcher = null;
+    }
+
+    private static TimeSpan MinInterval(TimeSpan left, TimeSpan right) =>
+        left <= right ? left : right;
 
     private sealed record RolloutFile(string Path, DateTimeOffset LastWriteAtUtc);
 }

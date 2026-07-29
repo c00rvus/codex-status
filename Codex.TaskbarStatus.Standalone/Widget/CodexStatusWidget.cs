@@ -284,17 +284,32 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
         var priorWidth = PreviewLogicalWidth;
         var now = DateTimeOffset.UtcNow;
 
-        _board = _statusReader.ReadBoard(_reviewedTaskKeys);
+        var nextBoard = _statusReader.ReadBoard(_reviewedTaskKeys);
+        var boardChanged = !ReferenceEquals(_board, nextBoard);
+        _board = nextBoard;
         _snapshot = _board.Primary;
-        NotifyAttentionTransitions();
+        if (boardChanged)
+        {
+            NotifyAttentionTransitions();
+        }
+
         _rateLimitService.RequestRefresh();
-        _rateLimits = _rateLimitService.Current;
+        var nextRateLimits = _rateLimitService.Current;
+        var rateLimitsChanged = !Equals(_rateLimits, nextRateLimits);
+        _rateLimits = nextRateLimits;
 
         RenderPreview(force: false, now);
         SyncSpinnerTimer();
         if (_flyoutVisible)
         {
-            RenderFlyout(now);
+            if (boardChanged || rateLimitsChanged)
+            {
+                RenderFlyout(now);
+            }
+            else
+            {
+                UpdateFlyoutTaskTimes(now);
+            }
         }
 
         if (priorVisibility != IsPreviewVisible || priorWidth != PreviewLogicalWidth)
@@ -1078,14 +1093,17 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
     {
         foreach (var task in _board.Tasks)
         {
+            if (!task.IsActive)
+            {
+                continue;
+            }
+
             if (!_flyoutTimeTexts.TryGetValue(task.TaskKey, out var text))
             {
                 continue;
             }
 
-            var value = task.IsActive
-                ? FormatElapsed(task.Elapsed(now))
-                : FormatUpdatedAt(task.StoppedAtUtc ?? task.LastUpdatedAtUtc);
+            var value = FormatElapsed(task.Elapsed(now));
             if (!string.Equals(text.Text, value, StringComparison.Ordinal))
             {
                 text.Text = value;
@@ -1594,9 +1612,13 @@ internal sealed class CodexStatusWidget : IAsyncDisposable
             return;
         }
 
-        foreach (var task in _board.Tasks.Where(
-                     task => task.Status == CodexExecutionStatuses.Running))
+        foreach (var task in _board.Tasks)
         {
+            if (task.Status != CodexExecutionStatuses.Running)
+            {
+                continue;
+            }
+
             if (!_flyoutSpinnerTexts.TryGetValue(task.TaskKey, out var text) ||
                 !_flyoutSpinnerAnimators.TryGetValue(task.TaskKey, out var animator))
             {

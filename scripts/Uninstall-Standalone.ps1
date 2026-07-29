@@ -10,6 +10,8 @@ $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $installRoot = [IO.Path]::GetFullPath(
     (Join-Path $env:LOCALAPPDATA 'Programs\Codex Status Source'))
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+$startupApprovedKey =
+    'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'
 
 Get-Process -Name 'Codex.TaskbarStatus.Standalone' -ErrorAction SilentlyContinue |
     Stop-Process -Force
@@ -28,6 +30,10 @@ if (Test-Path -LiteralPath $hookScript -PathType Leaf) {
 }
 
 Remove-ItemProperty -Path $runKey -Name 'Codex Status Source' -ErrorAction SilentlyContinue
+Remove-ItemProperty `
+    -Path $startupApprovedKey `
+    -Name 'Codex Status Source' `
+    -ErrorAction SilentlyContinue
 
 $expectedInstallRoot = [IO.Path]::GetFullPath(
     (Join-Path $env:LOCALAPPDATA 'Programs\Codex Status Source'))

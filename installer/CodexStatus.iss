@@ -7,6 +7,10 @@
 #define AppUrl "https://github.com/c00rvus/codex-status"
 #define AppExe "Codex.TaskbarStatus.Standalone.exe"
 #define BridgeExe "Codex.TaskbarStatus.Bridge.exe"
+#define StartupRegistryKey "Software\Microsoft\Windows\CurrentVersion\Run"
+#define StartupApprovedRegistryKey "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
+#define StartupValueName "Codex Status"
+#define UninstallRegistryKey "Software\Microsoft\Windows\CurrentVersion\Uninstall\{2C9BDF00-23D4-4469-8EE1-D79BD636A797}_is1"
 
 [Setup]
 AppId={{2C9BDF00-23D4-4469-8EE1-D79BD636A797}
@@ -51,7 +55,7 @@ Source: "..\artifacts\release-staging\tools\Configure-CodexHooks.ps1"; DestDir: 
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"; Parameters: "--open-settings"; WorkingDir: "{app}"; IconFilename: "{app}\{#AppExe}"
 
 [Registry]
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Codex Status"; ValueData: """{app}\{#AppExe}"""; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "{#StartupRegistryKey}"; ValueType: string; ValueName: "{#StartupValueName}"; ValueData: """{app}\{#AppExe}"" --startup"; Flags: uninsdeletevalue; Check: ShouldRegisterStartup
 
 [Run]
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\tools\Configure-CodexHooks.ps1"" -Action Install -BridgePath ""{app}\bridge\{#BridgeExe}"""; WorkingDir: "{app}"; StatusMsg: "Configuring Codex status hooks..."; Flags: runhidden waituntilterminated
@@ -62,11 +66,56 @@ Filename: "{sys}\taskkill.exe"; Parameters: "/IM {#AppExe} /T /F"; Flags: runhid
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\tools\Configure-CodexHooks.ps1"" -Action Uninstall -BridgePath ""{app}\bridge\{#BridgeExe}"""; WorkingDir: "{app}"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveCodexStatusHooks"
 
 [Code]
+var
+  ExistingInstallDetected: Boolean;
+
+function InitializeSetup(): Boolean;
+begin
+  ExistingInstallDetected :=
+    RegKeyExists(HKCU, '{#UninstallRegistryKey}');
+  Result := True;
+end;
+
+function IsStartupExplicitlyDisabled(): Boolean;
+var
+  ApprovalData: AnsiString;
+begin
+  Result := False;
+  if RegQueryBinaryValue(
+      HKCU,
+      '{#StartupApprovedRegistryKey}',
+      '{#StartupValueName}',
+      ApprovalData) then
+  begin
+    if Length(ApprovalData) > 0 then
+      Result := Ord(ApprovalData[1]) = $03;
+  end;
+end;
+
+function ShouldRegisterStartup(): Boolean;
+begin
+  Result :=
+    (not ExistingInstallDetected) or
+    (
+      RegValueExists(
+        HKCU,
+        '{#StartupRegistryKey}',
+        '{#StartupValueName}') and
+      (not IsStartupExplicitlyDisabled())
+    );
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   ResultCode: Integer;
 begin
   Result := '';
+  if ShouldRegisterStartup() then
+    RegDeleteValue(
+      HKCU,
+      '{#StartupApprovedRegistryKey}',
+      '{#StartupValueName}');
+
   Exec(
     ExpandConstant('{sys}\taskkill.exe'),
     '/IM {#AppExe} /T /F',
@@ -74,4 +123,19 @@ begin
     SW_HIDE,
     ewWaitUntilTerminated,
     ResultCode);
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usUninstall then
+  begin
+    RegDeleteValue(
+      HKCU,
+      '{#StartupRegistryKey}',
+      '{#StartupValueName}');
+    RegDeleteValue(
+      HKCU,
+      '{#StartupApprovedRegistryKey}',
+      '{#StartupValueName}');
+  end;
 end;

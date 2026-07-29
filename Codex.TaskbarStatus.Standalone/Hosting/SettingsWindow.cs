@@ -3,6 +3,7 @@ using Microsoft.UI;
 using Microsoft.UI.Composition.SystemBackdrops;
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
+using Microsoft.UI.Xaml.Automation;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Controls.Primitives;
 using Microsoft.UI.Xaml.Media;
@@ -17,19 +18,27 @@ internal sealed class SettingsWindow
     {
         private readonly Action<string> _onDraftChanged;
 
-        internal DraftContext(string settingsJson, Action<string> onDraftChanged)
+        internal DraftContext(
+            string settingsJson,
+            bool startWithWindows,
+            Action<string> onDraftChanged)
         {
             SettingsJson = string.IsNullOrWhiteSpace(settingsJson) ? "{}" : settingsJson;
+            StartWithWindows = startWithWindows;
             _onDraftChanged = onDraftChanged;
         }
 
         public string SettingsJson { get; private set; }
+
+        public bool StartWithWindows { get; private set; }
 
         public void SaveSettings(string settingsJson)
         {
             SettingsJson = string.IsNullOrWhiteSpace(settingsJson) ? "{}" : settingsJson;
             _onDraftChanged(SettingsJson);
         }
+
+        public void SetStartWithWindows(bool enabled) => StartWithWindows = enabled;
 
         public void RequestPreviewRefresh() => _onDraftChanged(SettingsJson);
     }
@@ -44,17 +53,21 @@ internal sealed class SettingsWindow
     internal SettingsWindow(
         CodexStatusWidget widget,
         string settingsJson,
+        bool startWithWindows,
         StandalonePlacementDraft placementDraft,
         IReadOnlyList<TaskbarMonitorOption> monitors,
         Action<string> onDraftChanged,
         Action<StandalonePlacementDraft> onPlacementDraftChanged,
-        Action<string, StandalonePlacementDraft> onSave,
+        Action<string, StandalonePlacementDraft, bool> onSave,
         Action onCancelled,
         Action onClosed)
     {
         _onCancelled = onCancelled;
         _onClosed = onClosed;
-        _context = new DraftContext(settingsJson, onDraftChanged);
+        _context = new DraftContext(
+            settingsJson,
+            startWithWindows,
+            onDraftChanged);
         var settingsContent = widget.CreateSettingsContent(_context)
             ?? throw new InvalidOperationException("The widget did not provide settings content.");
         _placementControl = new TaskbarPlacementSettingsControl(
@@ -100,6 +113,14 @@ internal sealed class SettingsWindow
             Content = "Save",
             MinWidth = 120,
         };
+        var saveError = new TextBlock
+        {
+            Foreground = new SolidColorBrush(ColorHelper.FromArgb(255, 255, 151, 151)),
+            FontSize = 12,
+            TextWrapping = TextWrapping.Wrap,
+            VerticalAlignment = VerticalAlignment.Center,
+            Visibility = Visibility.Collapsed,
+        };
         if (Application.Current.Resources.TryGetValue(
                 "AccentButtonStyle",
                 out var accentResource) &&
@@ -109,9 +130,24 @@ internal sealed class SettingsWindow
         }
         save.Click += (_, _) =>
         {
-            onSave(_context.SettingsJson, _placementControl.Draft);
-            _saved = true;
-            _window.Close();
+            save.IsEnabled = false;
+            saveError.Visibility = Visibility.Collapsed;
+            try
+            {
+                onSave(
+                    _context.SettingsJson,
+                    _placementControl.Draft,
+                    _context.StartWithWindows);
+                _saved = true;
+                _window.Close();
+            }
+            catch (Exception exception)
+            {
+                StandaloneLog.Write("Saving settings failed", exception);
+                saveError.Text = $"Could not save settings: {exception.Message}";
+                saveError.Visibility = Visibility.Visible;
+                save.IsEnabled = true;
+            }
         };
 
         var cancel = new Button
@@ -121,15 +157,31 @@ internal sealed class SettingsWindow
         };
         cancel.Click += (_, _) => _window.Close();
 
-        var actions = new StackPanel
+        var actionButtons = new StackPanel
         {
             Orientation = Orientation.Horizontal,
             HorizontalAlignment = HorizontalAlignment.Right,
             Spacing = 8,
+        };
+        actionButtons.Children.Add(save);
+        actionButtons.Children.Add(cancel);
+
+        var actions = new Grid
+        {
+            ColumnSpacing = 16,
             Margin = new Thickness(24, 12, 24, 20),
         };
-        actions.Children.Add(save);
-        actions.Children.Add(cancel);
+        actions.ColumnDefinitions.Add(new ColumnDefinition
+        {
+            Width = new GridLength(1, GridUnitType.Star),
+        });
+        actions.ColumnDefinitions.Add(new ColumnDefinition
+        {
+            Width = GridLength.Auto,
+        });
+        Grid.SetColumn(actionButtons, 1);
+        actions.Children.Add(saveError);
+        actions.Children.Add(actionButtons);
 
         var root = new Grid
         {
@@ -148,7 +200,11 @@ internal sealed class SettingsWindow
         var contentHost = new Border
         {
             Padding = new Thickness(24, 16, 24, 8),
-            Child = CreateSettingsTabs(settingsContent, _placementControl),
+            Child = CreateSettingsTabs(
+                settingsContent,
+                _placementControl,
+                _context.StartWithWindows,
+                _context.SetStartWithWindows),
         };
 
         Grid.SetRow(titleBar, 0);
@@ -243,7 +299,9 @@ internal sealed class SettingsWindow
 
     private static Grid CreateSettingsTabs(
         UIElement widgetSettings,
-        UIElement taskbarSettings)
+        UIElement taskbarSettings,
+        bool startWithWindows,
+        Action<bool> setStartWithWindows)
     {
         var widgetHost = new Grid();
         widgetHost.Children.Add(widgetSettings);
@@ -266,14 +324,54 @@ internal sealed class SettingsWindow
             Content = "Taskbar",
             MinWidth = 120,
         };
-        var navigation = new StackPanel
+        var pageButtons = new StackPanel
         {
             Orientation = Orientation.Horizontal,
             Spacing = 8,
+        };
+        pageButtons.Children.Add(widgetButton);
+        pageButtons.Children.Add(taskbarButton);
+
+        var startupToggle = new ToggleSwitch
+        {
+            IsOn = startWithWindows,
+            OnContent = string.Empty,
+            OffContent = string.Empty,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        AutomationProperties.SetName(startupToggle, "Start with Windows");
+        startupToggle.Toggled += (_, _) =>
+            setStartWithWindows(startupToggle.IsOn);
+        var startupSetting = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 10,
+            HorizontalAlignment = HorizontalAlignment.Right,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        startupSetting.Children.Add(new TextBlock
+        {
+            Text = "Start with Windows",
+            FontSize = 13,
+            VerticalAlignment = VerticalAlignment.Center,
+        });
+        startupSetting.Children.Add(startupToggle);
+
+        var navigation = new Grid
+        {
             Margin = new Thickness(0, 0, 0, 10),
         };
-        navigation.Children.Add(widgetButton);
-        navigation.Children.Add(taskbarButton);
+        navigation.ColumnDefinitions.Add(new ColumnDefinition
+        {
+            Width = new GridLength(1, GridUnitType.Star),
+        });
+        navigation.ColumnDefinitions.Add(new ColumnDefinition
+        {
+            Width = GridLength.Auto,
+        });
+        Grid.SetColumn(startupSetting, 1);
+        navigation.Children.Add(pageButtons);
+        navigation.Children.Add(startupSetting);
 
         void SelectPage(bool taskbarSelected)
         {

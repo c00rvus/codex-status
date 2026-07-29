@@ -70,7 +70,7 @@ internal sealed class CodexStatusBoardSnapshot
 
 internal sealed class CodexStatusReader : IDisposable
 {
-    private static readonly TimeSpan RolloutRefreshInterval = TimeSpan.FromSeconds(1.5);
+    private static readonly TimeSpan HookRefreshInterval = TimeSpan.FromSeconds(1.5);
     private static readonly TimeSpan AbandonedActiveAge = TimeSpan.FromDays(7);
     private static readonly TimeSpan MissingUnreadSignalRetention = TimeSpan.FromMinutes(15);
 
@@ -80,7 +80,15 @@ internal sealed class CodexStatusReader : IDisposable
     private readonly CodexDesktopUnreadThreadReader _unreadReader = new();
     private IReadOnlyList<CodexExecutionState> _cachedHookStates = [];
     private IReadOnlyList<CodexExecutionState> _cachedRollouts = [];
-    private DateTimeOffset _nextRolloutReadAt = DateTimeOffset.MinValue;
+    private readonly HashSet<string> _cachedPrioritySessionIds =
+        new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _cachedReviewedTaskKeys =
+        new(StringComparer.Ordinal);
+    private CodexDesktopUnreadState? _cachedUnreadState;
+    private CodexStatusBoardSnapshot? _cachedBoard;
+    private DateTimeOffset _nextHookReadAt = DateTimeOffset.MinValue;
+    private bool _hookStatesInitialized;
+    private bool _rolloutsInitialized;
 
     public CodexStatusSnapshot Read() => ReadBoard().Primary;
 
@@ -89,12 +97,47 @@ internal sealed class CodexStatusReader : IDisposable
     {
         var now = DateTimeOffset.UtcNow;
         var unread = _unreadReader.Read();
+        var boardInvalidated = !ReferenceEquals(unread, _cachedUnreadState);
+        _cachedUnreadState = unread;
 
-        if (now >= _nextRolloutReadAt)
+        if (!_hookStatesInitialized || now >= _nextHookReadAt)
         {
             _cachedHookStates = ReadHookStates();
+            _hookStatesInitialized = true;
+            _nextHookReadAt = now + HookRefreshInterval;
+            boardInvalidated = true;
+        }
+
+        var prioritySessionsChanged =
+            !_cachedPrioritySessionIds.SetEquals(unread.ThreadIds);
+        if (!_rolloutsInitialized
+            || prioritySessionsChanged
+            || _rolloutReader.HasPendingChanges)
+        {
             _cachedRollouts = _rolloutReader.ReadRecent(unread.ThreadIds);
-            _nextRolloutReadAt = now + RolloutRefreshInterval;
+            _rolloutsInitialized = true;
+            _cachedPrioritySessionIds.Clear();
+            _cachedPrioritySessionIds.UnionWith(unread.ThreadIds);
+            boardInvalidated = true;
+        }
+
+        var reviewedTasksChanged = reviewedTaskKeys is null
+            ? _cachedReviewedTaskKeys.Count > 0
+            : !_cachedReviewedTaskKeys.SetEquals(reviewedTaskKeys);
+        if (reviewedTasksChanged)
+        {
+            _cachedReviewedTaskKeys.Clear();
+            if (reviewedTaskKeys is not null)
+            {
+                _cachedReviewedTaskKeys.UnionWith(reviewedTaskKeys);
+            }
+
+            boardInvalidated = true;
+        }
+
+        if (!boardInvalidated && _cachedBoard is not null)
+        {
+            return _cachedBoard;
         }
 
         var states = BuildMergedStates(_cachedHookStates, _cachedRollouts);
@@ -130,12 +173,13 @@ internal sealed class CodexStatusReader : IDisposable
             .Take(20)
             .ToArray();
 
-        return new CodexStatusBoardSnapshot
+        _cachedBoard = new CodexStatusBoardSnapshot
         {
             Primary = primary,
             Tasks = tasks,
             UnreadSignalAvailable = unread.IsAvailable,
         };
+        return _cachedBoard;
     }
 
     public void Dispose() => _rolloutReader.Dispose();

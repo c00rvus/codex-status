@@ -28,6 +28,10 @@
              Link="Hosting\TrayIconActivationFilter.cs" />
     <Compile Include="..\Codex.TaskbarStatus.Standalone\Services\CodexStatusReader.cs"
              Link="Services\CodexStatusReader.cs" />
+    <Compile Include="..\Codex.TaskbarStatus.Standalone\Services\StartupLaunch.cs"
+             Link="Services\StartupLaunch.cs" />
+    <Compile Include="..\Codex.TaskbarStatus.Standalone\Services\WindowsStartupRegistration.cs"
+             Link="Services\WindowsStartupRegistration.cs" />
   </ItemGroup>
 
 </Project>

@@ -22,7 +22,7 @@ public sealed class RolloutRateLimitReaderTests : IDisposable
             new DateTime(2026, 7, 13, 10, 10, 0, DateTimeKind.Utc),
             """{"timestamp":"2026-07-13T10:10:00Z","type":"event_msg","payload":{"type":"token_count","rate_limits":null}}""");
 
-        var reader = new RolloutRateLimitReader(_directory);
+        using var reader = new RolloutRateLimitReader(_directory);
         var afterNull = reader.ReadLatest();
 
         Assert.Equal(RateLimitAvailability.Available, afterNull.FiveHour.Availability);
@@ -53,7 +53,8 @@ public sealed class RolloutRateLimitReaderTests : IDisposable
             new DateTime(2026, 7, 13, 12, 0, 0, DateTimeKind.Utc),
             DualEvent("2026-07-13T12:00:00Z", fiveHourUsed: 2, weeklyUsed: 3));
 
-        var snapshot = new RolloutRateLimitReader(_directory).ReadLatest();
+        using var reader = new RolloutRateLimitReader(_directory);
+        var snapshot = reader.ReadLatest();
 
         Assert.Equal(2d, snapshot.FiveHour.UsedPercent);
         Assert.Equal(3d, snapshot.Weekly.UsedPercent);
@@ -73,13 +74,14 @@ public sealed class RolloutRateLimitReaderTests : IDisposable
         var before = await File.ReadAllTextAsync(path);
 
         CodexRateLimitSnapshot snapshot;
+        using var reader = new RolloutRateLimitReader(_directory);
         await using (var writer = new FileStream(
                          path,
                          FileMode.Open,
                          FileAccess.ReadWrite,
                          FileShare.ReadWrite | FileShare.Delete))
         {
-            snapshot = new RolloutRateLimitReader(_directory).ReadLatest();
+            snapshot = reader.ReadLatest();
         }
 
         Assert.Equal(10d, snapshot.FiveHour.UsedPercent);
@@ -100,10 +102,11 @@ public sealed class RolloutRateLimitReaderTests : IDisposable
             new DateTime(2026, 7, 13, 11, 0, 0, DateTimeKind.Utc),
             """{"type":"event_msg","payload":{"type":"token_count","rate_limits":null}}""");
 
-        var boundedByFiles = new RolloutRateLimitReader(
+        using var fileBoundedReader = new RolloutRateLimitReader(
             _directory,
             maxRecentFiles: 1,
-            tailBytes: 4096).ReadLatest();
+            tailBytes: 4096);
+        var boundedByFiles = fileBoundedReader.ReadLatest();
 
         Assert.Equal(CodexRateLimitSnapshot.Unknown, boundedByFiles);
 
@@ -117,10 +120,11 @@ public sealed class RolloutRateLimitReaderTests : IDisposable
             tailPath,
             new DateTime(2026, 7, 13, 12, 0, 0, DateTimeKind.Utc));
 
-        var boundedByTail = new RolloutRateLimitReader(
+        using var tailBoundedReader = new RolloutRateLimitReader(
             _directory,
             maxRecentFiles: 1,
-            tailBytes: 1024).ReadLatest();
+            tailBytes: 1024);
+        var boundedByTail = tailBoundedReader.ReadLatest();
 
         Assert.Equal(CodexRateLimitSnapshot.Unknown, boundedByTail);
     }
@@ -128,9 +132,70 @@ public sealed class RolloutRateLimitReaderTests : IDisposable
     [Fact]
     public void ReadLatest_MissingDirectoryReturnsUnknown()
     {
-        var snapshot = new RolloutRateLimitReader(_directory).ReadLatest();
+        using var reader = new RolloutRateLimitReader(_directory);
+        var snapshot = reader.ReadLatest();
 
         Assert.Equal(CodexRateLimitSnapshot.Unknown, snapshot);
+    }
+
+    [Fact]
+    public async Task ReadLatest_ReusesCachedSnapshotWithoutAnotherFullScan()
+    {
+        Directory.CreateDirectory(_directory);
+        await WriteRolloutAsync(
+            "rollout-cached.jsonl",
+            new DateTime(2026, 7, 13, 13, 0, 0, DateTimeKind.Utc),
+            DualEvent("2026-07-13T13:00:00Z", fiveHourUsed: 12, weeklyUsed: 34));
+
+        using var reader = new RolloutRateLimitReader(
+            _directory,
+            fallbackRescanInterval: TimeSpan.FromHours(1));
+        var first = reader.ReadLatest();
+        var second = reader.ReadLatest();
+
+        Assert.Same(first, second);
+        Assert.Equal(1, reader.FullScanCount);
+    }
+
+    [Fact]
+    public async Task ReadLatest_WatcherRefreshesAnAppendedRateLimitEvent()
+    {
+        Directory.CreateDirectory(_directory);
+        var path = Path.Combine(_directory, "rollout-watched.jsonl");
+        await File.WriteAllTextAsync(
+            path,
+            DualEvent("2026-07-13T13:10:00Z", fiveHourUsed: 10, weeklyUsed: 20)
+            + Environment.NewLine);
+
+        using var reader = new RolloutRateLimitReader(
+            _directory,
+            fallbackRescanInterval: TimeSpan.FromHours(1));
+        Assert.Equal(10d, reader.ReadLatest().FiveHour.UsedPercent);
+
+        await File.AppendAllTextAsync(
+            path,
+            DualEvent("2026-07-13T13:11:00Z", fiveHourUsed: 15, weeklyUsed: 25)
+            + Environment.NewLine);
+
+        var expiresAt = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+        CodexRateLimitSnapshot refreshed;
+        do
+        {
+            refreshed = reader.ReadLatest();
+            if (refreshed.FiveHour.UsedPercent == 15d)
+            {
+                break;
+            }
+
+            await Task.Delay(25);
+        }
+        while (DateTime.UtcNow < expiresAt);
+
+        Assert.Equal(15d, refreshed.FiveHour.UsedPercent);
+        Assert.Equal(25d, refreshed.Weekly.UsedPercent);
+        Assert.Equal(2, reader.FullScanCount);
+        Assert.Same(refreshed, reader.ReadLatest());
+        Assert.Equal(2, reader.FullScanCount);
     }
 
     private async Task WriteRolloutAsync(

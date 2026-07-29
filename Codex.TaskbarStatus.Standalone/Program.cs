@@ -45,6 +45,11 @@ public static class Program
                     return;
                 }
             }
+            else if (StartupLaunch.IsStartupLaunch(Arguments))
+            {
+                ReleaseSingleInstanceResources();
+                return;
+            }
             else
             {
                 SignalExistingInstance();
