@@ -72,12 +72,14 @@ internal sealed class CodexStatusReader : IDisposable
 {
     private static readonly TimeSpan HookRefreshInterval = TimeSpan.FromSeconds(1.5);
     private static readonly TimeSpan AbandonedActiveAge = TimeSpan.FromDays(7);
+    private static readonly TimeSpan BootBoundaryTolerance = TimeSpan.FromMinutes(1);
     private static readonly TimeSpan MissingUnreadSignalRetention = TimeSpan.FromMinutes(15);
 
     private readonly StatusFileStore _statusStore = new();
     private readonly StatusSessionStore _statusSessionStore = new();
     private readonly RolloutStatusReader _rolloutReader = new();
     private readonly CodexDesktopUnreadThreadReader _unreadReader = new();
+    private readonly DateTimeOffset _activeExecutionEpochUtc = EstimateActiveExecutionEpochUtc();
     private IReadOnlyList<CodexExecutionState> _cachedHookStates = [];
     private IReadOnlyList<CodexExecutionState> _cachedRollouts = [];
     private readonly HashSet<string> _cachedPrioritySessionIds =
@@ -147,9 +149,36 @@ internal sealed class CodexStatusReader : IDisposable
                 item.Source,
                 item.State.SessionId is { } sessionId && unread.ThreadIds.Contains(sessionId)))
             .ToArray();
+        _cachedBoard = BuildBoard(
+            mapped,
+            reviewedTaskKeys,
+            unread.IsAvailable,
+            now,
+            _activeExecutionEpochUtc);
+        return _cachedBoard;
+    }
+
+    public void Dispose() => _rolloutReader.Dispose();
+
+    internal static CodexStatusBoardSnapshot BuildBoard(
+        IReadOnlyList<CodexStatusSnapshot> mapped,
+        IReadOnlySet<string>? reviewedTaskKeys,
+        bool unreadSignalAvailable,
+        DateTimeOffset now,
+        DateTimeOffset activeExecutionEpochUtc)
+    {
+        // An execution cannot survive a Windows restart. Filter abandoned
+        // active states before every selection, including the final primary
+        // fallback, so an abruptly interrupted rollout cannot restart the
+        // taskbar animation after the next boot.
+        var currentMapped = mapped
+            .Where(snapshot =>
+                !snapshot.IsActive ||
+                IsFreshActive(snapshot, now, activeExecutionEpochUtc))
+            .ToArray();
         var visibleMapped = reviewedTaskKeys is null || reviewedTaskKeys.Count == 0
-            ? mapped
-            : mapped
+            ? currentMapped
+            : currentMapped
                 .Where(snapshot =>
                     snapshot.IsActive ||
                     !reviewedTaskKeys.Contains(snapshot.TaskKey))
@@ -160,29 +189,26 @@ internal sealed class CodexStatusReader : IDisposable
             .OrderByDescending(snapshot => snapshot.LastUpdatedAtUtc)
             .FirstOrDefault()
             ?? visibleMapped
-            .Where(snapshot => snapshot.IsActive && IsFreshActive(snapshot, now))
+            .Where(snapshot => snapshot.IsActive)
             .OrderByDescending(snapshot => snapshot.LastUpdatedAtUtc)
             .FirstOrDefault()
             ?? visibleMapped.OrderByDescending(snapshot => snapshot.LastUpdatedAtUtc).FirstOrDefault()
             ?? new CodexStatusSnapshot();
 
         var tasks = visibleMapped
-            .Where(snapshot => ShouldShowInTaskList(snapshot, unread.IsAvailable, now))
+            .Where(snapshot => ShouldShowInTaskList(snapshot, unreadSignalAvailable, now))
             .OrderByDescending(snapshot => snapshot.IsActive)
             .ThenByDescending(snapshot => snapshot.LastUpdatedAtUtc)
             .Take(20)
             .ToArray();
 
-        _cachedBoard = new CodexStatusBoardSnapshot
+        return new CodexStatusBoardSnapshot
         {
             Primary = primary,
             Tasks = tasks,
-            UnreadSignalAvailable = unread.IsAvailable,
+            UnreadSignalAvailable = unreadSignalAvailable,
         };
-        return _cachedBoard;
     }
-
-    public void Dispose() => _rolloutReader.Dispose();
 
     internal static bool IsActiveState(string? status, DateTimeOffset? stoppedAtUtc)
     {
@@ -269,7 +295,9 @@ internal sealed class CodexStatusReader : IDisposable
     {
         if (snapshot.IsActive)
         {
-            return IsFreshActive(snapshot, now);
+            // Active snapshots have already passed the boot/session boundary
+            // filter in BuildBoard.
+            return true;
         }
 
         if (snapshot.Status is not (CodexExecutionStatuses.Completed
@@ -290,13 +318,32 @@ internal sealed class CodexStatusReader : IDisposable
         return now - snapshot.LastUpdatedAtUtc <= MissingUnreadSignalRetention;
     }
 
-    private static bool IsFreshActive(CodexStatusSnapshot snapshot, DateTimeOffset now) =>
-        snapshot.LastUpdatedAtUtc == DateTimeOffset.MinValue
-        || now - snapshot.LastUpdatedAtUtc <= AbandonedActiveAge;
+    private static bool IsFreshActive(
+        CodexStatusSnapshot snapshot,
+        DateTimeOffset now,
+        DateTimeOffset activeExecutionEpochUtc) =>
+        snapshot.LastUpdatedAtUtc != DateTimeOffset.MinValue
+        && snapshot.LastUpdatedAtUtc >= activeExecutionEpochUtc
+        && now - snapshot.LastUpdatedAtUtc <= AbandonedActiveAge;
 
     private static bool IsFresh(CodexStatusSnapshot snapshot, DateTimeOffset now) =>
         snapshot.LastUpdatedAtUtc == DateTimeOffset.MinValue
         || now - snapshot.LastUpdatedAtUtc <= AbandonedActiveAge;
+
+    private static DateTimeOffset EstimateActiveExecutionEpochUtc()
+    {
+        try
+        {
+            var uptime = TimeSpan.FromMilliseconds(Environment.TickCount64);
+            return DateTimeOffset.UtcNow - uptime - BootBoundaryTolerance;
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            // If the system clock is outside DateTimeOffset's representable
+            // range, retain the legacy age guard instead of hiding live work.
+            return DateTimeOffset.MinValue;
+        }
+    }
 
     internal static CodexExecutionState Merge(
         CodexExecutionState hookState,

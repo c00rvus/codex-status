@@ -33,7 +33,7 @@ public sealed class CompactActivityLabelTests
     }
 
     [Fact]
-    public void Resolve_RunningStatus_RemainsStableWithinFourSecondBucket()
+    public void Resolve_RunningStatus_RemainsStableForEntireExecution()
     {
         var first = CompactActivityLabel.Resolve(
             CodexExecutionStatuses.Running,
@@ -44,45 +44,38 @@ public sealed class CompactActivityLabelTests
             CodexExecutionStatuses.Running,
             "request-1",
             StartedAt,
-            StartedAt.AddMilliseconds(3_999));
+            StartedAt.AddDays(2));
 
         Assert.Equal(first, last);
     }
 
     [Fact]
-    public void Resolve_RunningStatus_RotatesEveryFourSeconds()
+    public void Resolve_RunningStatus_DistributesWordsAcrossExecutions()
     {
-        var labels = Enumerable.Range(0, 4)
-            .Select(bucket => CompactActivityLabel.Resolve(
+        var labels = Enumerable.Range(0, 64)
+            .Select(request => CompactActivityLabel.Resolve(
                 CodexExecutionStatuses.Running,
-                "request-1",
+                $"request-{request}",
                 StartedAt,
-                StartedAt.AddSeconds(bucket * 4)))
+                StartedAt.AddHours(request)))
             .ToArray();
 
-        Assert.Equal(4, labels.Distinct(StringComparer.Ordinal).Count());
-        Assert.Equal(labels[0], CompactActivityLabel.Resolve(
-            CodexExecutionStatuses.Running,
-            "request-1",
-            StartedAt,
-            StartedAt.AddSeconds(16)));
+        Assert.True(labels.Distinct(StringComparer.Ordinal).Count() > 1);
     }
 
     [Fact]
-    public void Resolve_RunningStatus_IsDeterministicForSameRequestAndTime()
+    public void Resolve_RunningStatus_IsDeterministicForSameRequest()
     {
-        var now = StartedAt.AddSeconds(12);
-
         var first = CompactActivityLabel.Resolve(
             CodexExecutionStatuses.Running,
             "request-42",
             StartedAt,
-            now);
+            StartedAt);
         var second = CompactActivityLabel.Resolve(
             CodexExecutionStatuses.Running,
             "request-42",
-            StartedAt,
-            now);
+            StartedAt.AddYears(1),
+            StartedAt.AddYears(2));
 
         Assert.Equal(first, second);
     }

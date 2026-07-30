@@ -2,13 +2,11 @@ namespace Codex.TaskbarStatus.Core;
 
 /// <summary>
 /// Produces the short activity word used by the compact taskbar preview.
-/// Active requests rotate through a stable sequence while terminal states use
-/// a fixed label that can be understood without the expanded flyout.
+/// Each active request receives one stable word while terminal states use a
+/// fixed label that can be understood without the expanded flyout.
 /// </summary>
 public static class CompactActivityLabel
 {
-    public static readonly TimeSpan RotationInterval = TimeSpan.FromSeconds(4);
-
     private static readonly string[] RunningLabels =
     [
         "Thinking",
@@ -25,10 +23,7 @@ public static class CompactActivityLabel
     {
         return status switch
         {
-            CodexExecutionStatuses.Running => ResolveRunning(
-                requestKey,
-                startedAtUtc,
-                nowUtc),
+            CodexExecutionStatuses.Running => ResolveRunning(requestKey),
             CodexExecutionStatuses.Waiting => "Waiting",
             CodexExecutionStatuses.Completed => "Done",
             CodexExecutionStatuses.Aborted => "Stopped",
@@ -37,18 +32,13 @@ public static class CompactActivityLabel
         };
     }
 
-    private static string ResolveRunning(
-        string? requestKey,
-        DateTimeOffset? startedAtUtc,
-        DateTimeOffset nowUtc)
+    private static string ResolveRunning(string? requestKey)
     {
-        var startedAt = startedAtUtc ?? DateTimeOffset.UnixEpoch;
-        var elapsed = nowUtc - startedAt;
-        var bucket = elapsed > TimeSpan.Zero
-            ? elapsed.Ticks / RotationInterval.Ticks
-            : 0;
+        // The request key contains the session/turn identity. Time is
+        // deliberately excluded so the selected word cannot change midway
+        // through an execution.
         var seed = StableHash(requestKey);
-        var index = (int)((seed + (ulong)bucket) % (ulong)RunningLabels.Length);
+        var index = (int)(seed % (ulong)RunningLabels.Length);
         return RunningLabels[index];
     }
 
